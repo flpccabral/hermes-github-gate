@@ -100,12 +100,25 @@ class GitHubGate:
 
     # ── Feedback Packet ──────────────────────────────────────
 
+    # Códigos de erro conhecidos como infraestrutura (não substring)
+    _INFRA_CODES = {"HISTORY_INCOMPLETE", "UNSHALLOW_TIMEOUT", "REPOSITORY_TYPE_UNKNOWN",
+                    "AMBIGUOUS_MERGE_BASE", "COMMENT_LIST_PARSE_FAILED"}
+
     def _feedback_packet(self, run_id: str, branch: str,
                          head_sha: str, base_sha: str, merge_base_sha: str,
                          result: dict) -> dict:
-        infra = [e for e in result["errors"]
-                if any(k in e.lower() for k in ("git ", "worktree", "fetch", "api",
-                                                "timeout", "merge-base", "shallow"))]
+        # Detecta infra por código do erro, não por substring da mensagem
+        infra = False
+        errors_structured = []
+        for i, e in enumerate(result.get("errors", [])):
+            code = f"ERR{i:02d}"
+            msg = str(e)
+            # Verifica se a mensagem começa com um código conhecido
+            is_infra = any(msg.startswith(ic) for ic in self._INFRA_CODES)
+            errors_structured.append({"code": code, "message": msg})
+            if is_infra:
+                infra = True
+
         overall = "infra_error" if (not result["success"] and infra) else \
                   "failed" if not result["success"] else \
                   "passed_with_warnings" if result["warnings"] else "passed"
@@ -117,8 +130,7 @@ class GitHubGate:
             "head_sha": head_sha, "base_sha": base_sha, "merge_base_sha": merge_base_sha,
             "overall_status": overall,
             "checkpoint_present": result.get("has_checkpoint", False),
-            "errors": [{"code": f"ERR{i:02d}", "message": e}
-                      for i, e in enumerate(result.get("errors", []))],
+            "errors": errors_structured,
             "warnings": [{"code": f"WRN{i:02d}", "message": w}
                         for i, w in enumerate(result.get("warnings", []))],
             "next_action": {"passed": "merge", "passed_with_warnings": "review_warnings",
@@ -180,7 +192,9 @@ class GitHubGate:
                     if isinstance(c, dict) and "id" in c:
                         comments.append(c)
                 except json.JSONDecodeError:
-                    continue
+                    result["status"] = "failed"
+                    result["error"] = f"COMMENT_LIST_PARSE_FAILED — entrada inválida na página {page}"
+                    return result
             if len(r.stdout.strip().split("\n")) < 100:
                 break
             page += 1
@@ -238,8 +252,11 @@ class GitHubGate:
             dups = all_after[1:]
 
             # Atualizar canônico com resultado atual
-            self._gh("api", f"repos/{self.repo}/issues/comments/{canonical['id']}",
+            patch_r = self._gh("api", f"repos/{self.repo}/issues/comments/{canonical['id']}",
                      "-X", "PATCH", "-f", f"body={body}")
+            if patch_r.returncode != 0:
+                self._log(f"  PATCH do canônico falhou — duplicatas mantidas p/ próximo poll")
+                return
 
             # Remover duplicatas
             for dup in dups:
@@ -265,8 +282,11 @@ class GitHubGate:
                 return
 
         # Semanticamente diferente → atualizar canônico
-        self._gh("api", f"repos/{self.repo}/issues/comments/{canonical['id']}",
+        patch_r = self._gh("api", f"repos/{self.repo}/issues/comments/{canonical['id']}",
                  "-X", "PATCH", "-f", f"body={body}")
+        if patch_r.returncode != 0:
+            self._log(f"  PATCH do canônico falhou — duplicatas mantidas p/ próximo poll")
+            return
 
         for dup in duplicates:
             self._gh("api", f"repos/{self.repo}/issues/comments/{dup['id']}",
@@ -307,12 +327,11 @@ class GitHubGate:
 
     # ── merge-base (Ponto 2 + Ponto 3 + Ponto 4) ──────────────
 
-    def _classify_merge_base(self, all_mb: list[str], is_shallow: bool,
-                             unshallow_attempted: bool) -> tuple:
-        """Classificador ÚNICO de merge-base. Retorna (sha or None, error_code or None)."""
+    def _classify_merge_base(self, all_mb: list[str], is_shallow: bool) -> tuple:
+        """Classificador ÚNICO de merge-base.
+        is_shallow: estado ATUAL do repositório (re-verificado após unshallow).
+        Retorna (sha or None, error_code or None)."""
         if len(all_mb) == 0:
-            if unshallow_attempted:
-                return None, "HISTORY_INCOMPLETE"
             if is_shallow:
                 return None, "HISTORY_INCOMPLETE"
             return None, "UNRELATED_HISTORIES"
@@ -378,8 +397,10 @@ class GitHubGate:
                     result["errors"].append("HISTORY_INCOMPLETE — unshallow falhou")
                     return None
 
-                # Classificador único
-                sha, err = self._classify_merge_base([], is_shallow, already_unshallowed)
+                # Classificador único (re-verifica shallow state atual)
+                shallow_r2 = self._git("rev-parse", "--is-shallow-repository")
+                is_shallow_now = shallow_r2.returncode == 0 and shallow_r2.stdout.strip() == "true"
+                sha, err = self._classify_merge_base([], is_shallow_now)
                 if err:
                     result["success"] = False
                     result["errors"].append(err)
@@ -393,7 +414,7 @@ class GitHubGate:
             shallow_r = self._git("rev-parse", "--is-shallow-repository")
             is_shallow = (shallow_r.returncode == 0 and shallow_r.stdout.strip() == "true")
 
-            sha, err = self._classify_merge_base(all_mb, is_shallow, already_unshallowed)
+            sha, err = self._classify_merge_base(all_mb, is_shallow)
             if err:
                 result["success"] = False
                 result["errors"].append(err)
