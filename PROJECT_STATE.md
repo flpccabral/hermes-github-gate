@@ -1,6 +1,6 @@
 # PROJECT STATE — L1 COMPLETE
 ## Status
-- main: bf13c41
+- main: 35d8f40
 - PR#3 (L1 Gate): merged
 - PR#4 (Test Suite 28 tests): merged
 - PR#5 (Correcoes B1-B4): merged
@@ -16,5 +16,5 @@
 - 008: Supersessao parcial 001 (Tier 3 escritor)
 ## Proximos
 - P1: Testes de integracao (tests/integration/)
-- P2: Polling como servico (systemd)
+- P2: Polling como servico supervisionado (macOS: launchd, Linux: systemd)
 - P3: Robustez operacional (lock, timeout, metricas)

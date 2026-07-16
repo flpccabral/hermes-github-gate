@@ -52,7 +52,7 @@ BASELINE — TODOS OS NIVEIS:
   - Zero blockers
 LOW_RISK: baseline + 1 aprovacao Tier 1
 MEDIUM_RISK: baseline + 2 revisoes Tier 1
-HIGH_RISK: baseline + 2 aprovoes Tier 1 + revisao de seguranca + autorizacao explicita TIER_0
+HIGH_RISK: baseline + 2 aprovacoes Tier 1 + revisao de seguranca + autorizacao explicita TIER_0
 
 ## Bridge
 - **Repositório**: flpccabral/hermes-github-gate (fonte de verdade)
