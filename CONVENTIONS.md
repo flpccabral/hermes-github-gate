@@ -38,13 +38,21 @@ hermes-github-gate/
 - **TIER_3** — Sub-agente (kimi-k2.7-code:cloud): única entidade que escreve código. Tool calling via Ollama local proxy.
 
 ## Planos Transversais
-- **CONTROL PLANE** (Gate): políticas, permissões, máquina de estados, regras de aprovação, allowlists
+- **CONTROL PLANE**
+  - Operador: Tier 2 / Hermes
+  - Enforcement: Gate, CI e GitHub branch protection
+  - Responsabilidades: políticas, permissões, state machine, risk classification, allowlists
 - **AUDIT PLANE**: eventos estruturados, logs imutáveis, proveniência, métricas, dados de recuperação
 
 ## Regras de Aprovação
-- **LOW_RISK**: 1 Tier 1 approval + testes + CI + Gate
-- **MEDIUM_RISK**: 2 Tier 1 reviews, 0 unresolved blockers
-- **HIGH_RISK**: 2 Tier 1 approvals + TIER_0 explicit authorization + security review
+BASELINE — TODOS OS NIVEIS:
+  - Testes requeridos passando
+  - CI verde
+  - Gate verde
+  - Zero blockers
+LOW_RISK: baseline + 1 aprovacao Tier 1
+MEDIUM_RISK: baseline + 2 revisoes Tier 1
+HIGH_RISK: baseline + 2 aprovoes Tier 1 + revisao de seguranca + autorizacao explicita TIER_0
 
 ## Bridge
 - **Repositório**: flpccabral/hermes-github-gate (fonte de verdade)
