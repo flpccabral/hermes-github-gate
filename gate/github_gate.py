@@ -59,13 +59,15 @@ class GitHubGate:
         branches = json.loads(r.stdout)
         ai_branches = []
         for b in branches:
-            name = b["name"]
-            if name.startswith(BRANCH_PREFIX) and name != "main":
-                ai_branches.append({
-                    "name": name,
-                    "sha": b["commit"]["sha"],
-                    "date": b["commit"]["commit"]["author"]["date"],
-                })
+            name = b.get("name", "")
+            if not name.startswith(BRANCH_PREFIX) or name == "main":
+                continue
+            commit_info = b.get("commit", {}) or {}
+            ai_branches.append({
+                "name": name,
+                "sha": commit_info.get("sha", "?"),
+                "date": commit_info.get("commit", {}).get("author", {}).get("date", "?"),
+            })
         return ai_branches
 
     def get_branch_diff(self, branch: str, base: str = "main") -> list[dict]:
