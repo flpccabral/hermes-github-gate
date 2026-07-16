@@ -23,7 +23,10 @@ hermes-github-gate/
 - Commits: `checkpoint(<tier>): <descricao>`
 - Python: snake_case para funções/variáveis, PascalCase para classes
 
-## Git
-- main protegida: require PR + status check
-- Código de tier web (Claude/ChatGPT) sempre em branch
-- Hermes valida antes de entrar na main
+## IA-IA Communication Protocol (REGRIA FIXA)
+- Toda comunicação entre modelos de IA DEVE usar formato IA-IA
+- Seções nomeadas em MAIÚSCULAS: STATUS / PROBLEMA / FIX / DECISAO
+- Bullet points, chaves tipo B1/B2, sem parágrafos longos
+- Proibido: saudações, agradecimentos, linguagem prolixa
+- Solicitar resposta no mesmo formato: "Responda: STATUS / DECISAO / PROXIMOS_PASSOS"
+- Aplicável a: ChatGPT, Claude, delegate_task, cronjobs, qualquer sub-agente
