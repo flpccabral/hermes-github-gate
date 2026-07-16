@@ -107,10 +107,9 @@ class GitHubGate:
             return None
         return r.stdout.strip()
 
-    def post_pr_comment(self, branch: str, body: str, force: bool = False):
+    def post_pr_comment(self, branch: str, body: str):
         """Posta comentário no PR associado ao branch.
-        Só posta se ainda não postou o mesmo conteúdo (evita spam a cada poll).
-        Use force=True para sobrescrever."""
+        Só posta se ainda não postou o mesmo body (evita spam a cada poll)."""
         r = self._gh("pr", "list", "--repo", self.repo,
                       "--head", branch, "--state", "open",
                       "--json", "number", "--jq", ".[0].number")
@@ -118,12 +117,11 @@ class GitHubGate:
             return
         pr_num = r.stdout.strip()
         
-        if not force:
-            # Verifica se já postou esse body antes
-            comments = self._gh("pr", "list", "--repo", self.repo,
-                                "--json", "comments", "--jq", ".[0].comments")
-            # fallback: só posta se não for identical
-            pass
+        # Verifica comentários existentes para evitar duplicação
+        comments = self._gh("api", f"repos/{self.repo}/issues/{pr_num}/comments",
+                           "--jq", ".[].body")
+        if comments.returncode == 0 and body.strip() in comments.stdout:
+            return  # Já postou este conteúdo
         
         self._gh("pr", "comment", "--repo", self.repo, pr_num, "--body", body)
 
