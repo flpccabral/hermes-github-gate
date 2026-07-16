@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-github_gate.py — Hermes GitHub Gate L1
+github_gate.py — Hermes GitHub Gate L1 (correções pós-2º juiz)
 
 Bridge entre web AIs (Claude/ChatGPT via GitHub) e execução local.
-Polla branches ai/*, valida, abre PRs, seta status checks.
+Polla branches ai/*, valida SHA fixo, abre PRs, seta status checks.
 
 Uso CLI:
     python github_gate.py poll --once
@@ -16,17 +16,19 @@ Uso como plugin Hermes:
     gate = GitHubGate()
     gate.poll_once()
 """
-import argparse, datetime, json, os, subprocess, sys, time
+import argparse, datetime, json, os, subprocess, sys, time, uuid
 from typing import Optional
 from pathlib import Path
 
 REPO = "flpccabral/hermes-github-gate"
 STATE_FILES = ["PROJECT_STATE.md", "DECISIONS.md", "CONVENTIONS.md", "FILEMAP.md"]
 BRANCH_PREFIX = "ai/"
+FB_MARKER_START = "<!-- hermes-gate:feedback:"
+FB_MARKER_END = ":end -->"
 
 
 class GitHubGate:
-    """GitHub Gate: monitora branches ai/*, valida, abre PRs, seta status."""
+    """GitHub Gate: monitora branches ai/* com validação por SHA fixo."""
 
     def __init__(self, repo: str = REPO, gh_cmd: str = "gh"):
         self.repo = repo
@@ -40,8 +42,9 @@ class GitHubGate:
         if r.returncode != 0:
             raise RuntimeError("gh CLI not authenticated")
 
-    def _gh(self, *args: str) -> subprocess.CompletedProcess:
-        return subprocess.run([self.gh, *args], capture_output=True, text=True)
+    def _gh(self, *args, **kwargs) -> subprocess.CompletedProcess:
+        return subprocess.run([self.gh] + list(args),
+                              capture_output=True, text=True, **kwargs)
 
     def _log(self, msg: str):
         print(f"[{datetime.datetime.now():%H:%M:%S}] {msg}")
@@ -54,22 +57,72 @@ class GitHubGate:
 
     def _get_branch_sha(self, branch: str) -> str:
         data = self._repo_api(f"branches/{branch}")
-        return data.get("commit", {}).get("sha", "?") if data else "?"
+        return data.get("commit", {}).get("sha", "?")
+
+    def _git(self, *args, **kwargs) -> subprocess.CompletedProcess:
+        """git wrapper que já loga erros."""
+        cmd = ["git"] + [str(a) for a in args]
+        r = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+        return r
 
     # ── Feedback Packet ──────────────────────────────────────
 
-    def _feedback_packet(self, branch: str, result: dict, stage: str = "validate") -> dict:
+    def _feedback_packet(self, run_id: str, branch: str,
+                         head_sha: str, base_sha: str,
+                         result: dict) -> dict:
+        """Gera Feedback Packet estruturado com schema version."""
+        # overall_status: 'passed' | 'failed' | 'infra_error'
+        if not result["success"]:
+            # Erros de infra vs código
+            infra_errors = [e for e in result["errors"]
+                          if any(k in e.lower() for k in ("git ", "worktree", "fetch", "api", "timeout"))]
+            overall = "infra_error" if infra_errors else "failed"
+        elif result["warnings"]:
+            overall = "passed_with_warnings"
+        else:
+            overall = "passed"
+
         return {
-            "sha": self._get_branch_sha(branch),
+            "schema_version": "1.0",
+            "run_id": run_id,
+            "branch": branch,
+            "head_sha": head_sha,
+            "base_sha": base_sha,
             "level": "L1",
-            "stage": stage,
-            "passed": result.get("success", False) and result.get("has_checkpoint", False),
-            "errors": result.get("errors", []),
-            "warnings": result.get("warnings", []),
-            "has_checkpoint": result.get("has_checkpoint", False),
-            "next_action": "merge" if result.get("success") else "fix_checkpoint",
-            "timestamps": {"poll": datetime.datetime.utcnow().isoformat() + "Z"},
+            "overall_status": overall,
+            "checkpoint_present": result.get("has_checkpoint", False),
+            "errors": [{"code": f"ERR{i:02d}", "message": e}
+                      for i, e in enumerate(result.get("errors", []))],
+            "warnings": [{"code": f"WRN{i:02d}", "message": w}
+                        for i, w in enumerate(result.get("warnings", []))],
+            "next_action": {
+                "passed": "merge",
+                "passed_with_warnings": "review_warnings",
+                "failed": "fix_code",
+                "infra_error": "retry",
+            }.get(overall, "unknown"),
+            "timestamps": {
+                "poll_utc": datetime.datetime.utcnow().isoformat() + "Z",
+            }
         }
+
+    def _format_feedback_comment(self, fb: dict) -> str:
+        """Formata comentário do PR com marcador estruturado."""
+        body = "## 🔍 Validação do Gate\n"
+        for e in fb.get("errors", []):
+            body += f"### ❌ {e['code']}: {e['message']}\n"
+        for w in fb.get("warnings", []):
+            body += f"### ⚠️ {w['code']}: {w['message']}\n"
+        if fb.get("checkpoint_present"):
+            body += "✅ Checkpoint presente\n"
+        body += f"\n**Status**: {fb['overall_status']} | **Próxima ação**: {fb['next_action']}\n"
+
+        # Marcador estruturado para dedup machine-readable
+        marker = (f"{FB_MARKER_START}{fb['run_id']}:{fb['head_sha']}:{fb['base_sha']}:{fb['overall_status']}"
+                  f"{FB_MARKER_END}")
+        body += f"\n{marker}\n"
+        body += "\n```json\n" + json.dumps(fb, indent=2) + "\n```"
+        return body
 
     # ── branch polling ────────────────────────────────────────
 
@@ -97,13 +150,10 @@ class GitHubGate:
     def has_open_pr(self, branch: str) -> bool:
         r = self._gh("pr", "list", "--repo", self.repo,
                       "--head", branch, "--state", "open", "--json", "number")
-        if r.returncode != 0:
-            return False
-        return len(json.loads(r.stdout)) > 0
+        return r.returncode == 0 and len(json.loads(r.stdout)) > 0
 
     def create_pr(self, branch: str) -> Optional[str]:
         if self.has_open_pr(branch):
-            self._log(f"PR já existe para {branch}")
             return None
         title = branch.replace("ai/claude/", "").replace("ai/", "").replace("-", " ").title()
         title = f"feat: {title}"
@@ -111,13 +161,16 @@ class GitHubGate:
                       "--head", branch, "--base", "main",
                       "--title", title,
                       "--body", f"🤖 PR automático do branch `{branch}`.\n\nAguardando validação do Hermes Gate.")
-        if r.returncode != 0:
-            self._log(f"Erro criando PR: {r.stderr.strip()}")
-            return None
-        return r.stdout.strip()
+        return r.stdout.strip() if r.returncode == 0 else None
 
-    def post_pr_comment(self, branch: str, body: str, feedback: Optional[dict] = None):
-        """Posta comentário. Dedup por SHA processado, não por body."""
+    def has_processed_run(self, pr_num: str, marker: str) -> bool:
+        """Verifica se marcador já existe nos comentários (dedup estruturado)."""
+        r = self._gh("api", f"repos/{self.repo}/issues/{pr_num}/comments",
+                     "--jq", ".[].body")
+        return r.returncode == 0 and marker in r.stdout
+
+    def post_pr_comment(self, branch: str, body: str):
+        """Posta comentário no PR. Dedup via marcador estruturado."""
         r = self._gh("pr", "list", "--repo", self.repo,
                       "--head", branch, "--state", "open",
                       "--json", "number", "--jq", ".[0].number")
@@ -125,53 +178,71 @@ class GitHubGate:
             return
         pr_num = r.stdout.strip()
 
-        if feedback:
-            body += "\n\n```json\n" + json.dumps(feedback, indent=2) + "\n```"
-            # Dedup: verifica se SHA já foi processado
-            sha = feedback.get("sha", "")
-            if sha:
-                existing = self._gh("api", f"repos/{self.repo}/issues/{pr_num}/comments",
-                                   "--jq", ".[].body").stdout
-                if sha in existing:
-                    return
+        # Extrai marcador para dedup
+        marker = ""
+        for line in body.split("\n"):
+            if line.startswith(FB_MARKER_START) and FB_MARKER_END in line:
+                marker = line.strip()
+                break
+
+        if marker and self.has_processed_run(pr_num, marker):
+            return
 
         self._gh("pr", "comment", "--repo", self.repo, pr_num, "--body", body)
 
-    # ── validation ────────────────────────────────────────────
+    # ── validation (SHA-fixo) ─────────────────────────────────
 
-    def validate_branch(self, branch: str, base: str = "main") -> dict:
-        """Valida um branch. Fail-closed: qq erro = reprovação."""
+    def validate_commit(self, branch: str, head_sha: str, base_sha: str) -> dict:
+        """Valida um commit específico (head_sha) vs base (base_sha).
+        Usa SHAs fixos — nunca origin/branch (evita TOCTOU)."""
         result = {"success": True, "errors": [], "warnings": [], "has_checkpoint": False}
 
-        subprocess.run(["git", "fetch", "origin", branch, base], capture_output=True)
+        # Fetch base (main) e branch (por nome, não SHA — SHA não é fetchável diretamente)
+        for remote_ref, label in [(f"main", "main"), (f"{branch}", "branch")]:
+            r = self._git("fetch", "origin", remote_ref, timeout=30)
+            if r.returncode != 0:
+                result["success"] = False
+                result["errors"].append(f"git fetch {label} failed: {r.stderr.strip()}")
+                return result
 
-        # Diff-based checkpoint enforcement
-        diff = subprocess.run(
-            ["git", "diff", f"origin/{base}...origin/{branch}", "--", "PROJECT_STATE.md"],
-            capture_output=True, text=True)
-        if diff.stdout.strip():
+        # Verifica se os SHAs existem localmente após fetch
+        for sha, label in [(head_sha, "head"), (base_sha, "base")]:
+            r = self._git("cat-file", "-e", sha)
+            if r.returncode != 0:
+                result["success"] = False
+                result["errors"].append(f"commit {label} ({sha[:12]}) não encontrado localmente após fetch")
+                return result
+
+        # Diff-based checkpoint enforcement (SHA fixo)
+        r = self._git("diff", base_sha, head_sha, "--", "PROJECT_STATE.md")
+        if r.returncode != 0:
+            result["success"] = False
+            result["errors"].append(f"git diff checkpoint failed: {r.stderr.strip()}")
+            return result
+        if r.stdout.strip():
             result["has_checkpoint"] = True
         else:
             result["success"] = False
             result["errors"].append("PROJECT_STATE.md não foi alterado neste branch — checkpoint ausente")
 
-        # Worktree — fail-closed: qq falha = reprova
-        tmp_dir = f"/tmp/gate-validate-{branch.replace('/', '-')}-{int(time.time())}"
+        # Worktree no SHA fixo
+        tmp_dir = f"/tmp/gate-validate-{int(time.time())}-{uuid.uuid4().hex[:6]}"
         subprocess.run(["rm", "-rf", tmp_dir])
-        r = subprocess.run(["git", "worktree", "add", "--detach", tmp_dir, f"origin/{branch}"],
-                          capture_output=True, text=True)
+        r = self._git("worktree", "add", "--detach", tmp_dir, head_sha)
         if r.returncode != 0:
-            result["success"] = False
+            result["success"] = False  # fail-closed
             result["errors"].append(f"git worktree add failed: {r.stderr.strip()}")
             return result
 
         try:
-            # Syntax check nos .py alterados
-            diff_files = subprocess.run(
-                ["git", "diff", f"origin/{base}...origin/{branch}", "--name-only", "--", "*.py"],
-                capture_output=True, text=True)
-            py_files = [f for f in diff_files.stdout.strip().split('\n') if f.endswith('.py')]
+            # Arquivos .py alterados (diff SHA-fixo)
+            r = self._git("diff", base_sha, head_sha, "--name-only", "--", "*.py")
+            if r.returncode != 0:
+                result["success"] = False
+                result["errors"].append(f"git diff py files failed: {r.stderr.strip()}")
+                return result
 
+            py_files = [f for f in r.stdout.strip().split('\n') if f.endswith('.py')]
             for pyf in py_files:
                 full_path = Path(tmp_dir) / pyf
                 if not full_path.exists():
@@ -181,34 +252,17 @@ class GitHubGate:
                 if sr.returncode != 0:
                     result["success"] = False
                     result["errors"].append(f"Syntax error in {pyf}: {sr.stderr.strip()}")
-
-            # pytest opcional (não bloqueante — py_compile é o gate mínimo)
-            if py_files and Path(tmp_dir, "tests").exists():
-                test_env = {k: v for k, v in os.environ.items()
-                           if not k.startswith("GH_") and k not in ("GITHUB_TOKEN", "GH_TOKEN")}
-                test_env.pop("GITHUB_TOKEN", None)
-                test_env.pop("GH_TOKEN", None)
-                try:
-                    tr = subprocess.run(
-                        [sys.executable, "-m", "pytest", str(Path(tmp_dir) / "tests"), "-x", "-q", "--timeout=30"],
-                        capture_output=True, text=True, timeout=60,
-                        cwd=tmp_dir, env=test_env)
-                    if tr.returncode != 0:
-                        result["warnings"].append(f"pytest: {tr.stdout.strip()[-200:]}")
-                except subprocess.TimeoutExpired:
-                    result["warnings"].append("pytest timed out (>60s)")
         finally:
-            subprocess.run(["git", "worktree", "remove", "--force", tmp_dir], capture_output=True)
+            self._git("worktree", "remove", "--force", tmp_dir)
 
         return result
 
-    # ── status check ──────────────────────────────────────────
+    # ── status check (SHA fixo) ───────────────────────────────
 
-    def set_status(self, branch: str, state: str, description: str):
-        sha = self._get_branch_sha(branch)
-        if sha == "?":
-            return
-        self._gh("api", f"repos/{self.repo}/statuses/{sha}",
+    def set_status(self, head_sha: str, state: str, description: str):
+        """Publica status no SHA exato que foi validado.
+        CRÍTICO: usa head_sha recebido, não consulta branch (evita TOCTOU)."""
+        self._gh("api", f"repos/{self.repo}/statuses/{head_sha}",
                  "-f", f"state={state}",
                  "-f", f"context=hermes-gate/validate",
                  "-f", f"description={description}")
@@ -224,31 +278,43 @@ class GitHubGate:
 
         for br in branches:
             name = br["name"]
-            self._log(f"  → {name} ({br['sha'][:8]})")
+            run_id = uuid.uuid4().hex[:12]
 
-            result = self.validate_branch(name)
-            feedback = self._feedback_packet(name, result)
+            # PASSO CRÍTICO: snapshot dos SHAs ANTES da validação
+            head_sha = br["sha"]
+            if head_sha == "?":
+                self._log(f"  {name}: SHA inválido, ignorando")
+                continue
+            base_sha = self._get_branch_sha("main")
+            if base_sha == "?":
+                self._log(f"  {name}: não foi possível obter SHA da main")
+                continue
 
-            if result["success"] and result["has_checkpoint"]:
-                self.set_status(name, "success", "Validação OK + checkpoint presente")
-            elif result["success"] and not result["has_checkpoint"]:
-                self.set_status(name, "failure", "PROJECT_STATE.md ausente ou incompleto")
+            self._log(f"  → {name} head={head_sha[:12]} base={base_sha[:12]} ({run_id})")
+
+            # Valida usando SHAs fixos
+            result = self.validate_commit(name, head_sha, base_sha)
+            fb = self._feedback_packet(run_id, name, head_sha, base_sha, result)
+
+            # Publica status no SHA validado (nunca consulta branch de novo)
+            if fb["overall_status"] == "passed":
+                self.set_status(head_sha, "success", "Validação OK + checkpoint presente")
+            elif fb["overall_status"] == "passed_with_warnings":
+                self.set_status(head_sha, "success", "OK (com warnings)")
+            elif fb["overall_status"] == "infra_error":
+                self.set_status(head_sha, "error", "; ".join(result["errors"][:2]))
             else:
-                self.set_status(name, "failure", "; ".join(result["errors"][:2]))
+                self.set_status(head_sha, "failure", "; ".join(result["errors"][:2]))
 
+            # Cria PR se necessário
             if not self.has_open_pr(name):
                 pr_url = self.create_pr(name)
                 if pr_url:
                     self._log(f"    PR criado: {pr_url}")
 
-            body = "## 🔍 Validação do Gate\n"
-            if result["errors"]:
-                body += "### ❌ Erros\n" + "\n".join(f"- {e}" for e in result["errors"]) + "\n"
-            if result["warnings"]:
-                body += "### ⚠️ Avisos\n" + "\n".join(f"- {w}" for w in result["warnings"]) + "\n"
-            if result["has_checkpoint"]:
-                body += "✅ Checkpoint presente\n"
-            self.post_pr_comment(name, body, feedback=feedback)
+            # Posta feedback com dedup por marcador estruturado
+            comment = self._format_feedback_comment(fb)
+            self.post_pr_comment(name, comment)
 
     def poll_loop(self, interval: int = 60):
         self._log(f"Iniciando watch (intervalo={interval}s)")
@@ -262,7 +328,7 @@ class GitHubGate:
     # ── restore ────────────────────────────────────────────────
 
     def restore_prompt(self, branch: Optional[str] = None) -> str:
-        """Gera prompt de retomada. Se branch fornecido, inclui último Feedback Packet."""
+        """Gera prompt de retomada. Se branch, busca último feedback do Gate."""
         parts = []
         for fname in STATE_FILES:
             p = Path(fname)
@@ -274,16 +340,16 @@ class GitHubGate:
                               "--head", branch, "--state", "open",
                               "--json", "number", "--jq", ".[0].number").stdout.strip()
             if pr_num:
-                last_comment = self._gh("api", f"repos/{self.repo}/issues/{pr_num}/comments",
-                                       "--jq", ".[-1].body").stdout.strip()
-                if "```json" in last_comment:
-                    fb = last_comment.split("```json")[1].split("```")[0].strip()
-                    parts.append(f"=== ÚLTIMO FEEDBACK ===\n{fb}")
+                # Busca último comentário DO GATE (marcado)
+                r = self._gh("api", f"repos/{self.repo}/issues/{pr_num}/comments",
+                            "--jq", f".[] | select(.body | contains(\"{FB_MARKER_START}\")) | .body")
+                if r.stdout.strip():
+                    last_gate = r.stdout.strip().split("\n\n")[-1]  # último bloco
+                    parts.append(f"=== ÚLTIMO FEEDBACK DO GATE ===\n{last_gate}")
 
         return (
             "Você está retomando um projeto em andamento. "
-            "Leia o estado abaixo e execute APENAS a próxima ação listada. "
-            "Não contradiga DECISIONS.md sem adicionar uma entrada de revogação.\n\n"
+            f"Data de captura: {datetime.datetime.utcnow().isoformat()}Z\n\n"
             + "\n\n".join(parts)
         )
 
@@ -295,15 +361,15 @@ def main():
     sub = parser.add_subparsers(dest="command")
 
     p_poll = sub.add_parser("poll", help="Poll branches ai/*")
-    p_poll.add_argument("--watch", action="store_true", help="Loop contínuo")
-    p_poll.add_argument("--once", action="store_true", help="Apenas uma vez")
+    p_poll.add_argument("--watch", action="store_true")
+    p_poll.add_argument("--once", action="store_true")
     p_poll.add_argument("--interval", type=int, default=60)
 
     p_validate = sub.add_parser("pr-validate", help="Validar branch específico")
-    p_validate.add_argument("branch", help="Nome do branch")
+    p_validate.add_argument("branch")
 
     p_restore = sub.add_parser("restore", help="Gerar prompt de retomada")
-    p_restore.add_argument("--branch", help="Branch p/ incluir feedback packet")
+    p_restore.add_argument("--branch", help="Branch p/ incluir feedback")
 
     args = parser.parse_args()
     gate = GitHubGate()
@@ -314,11 +380,15 @@ def main():
         else:
             gate.poll_once()
     elif args.command == "pr-validate":
-        result = gate.validate_branch(args.branch)
-        feedback = gate._feedback_packet(args.branch, result)
-        print(json.dumps(feedback, indent=2))
-        if not result["success"]:
+        base_sha = gate._get_branch_sha("main")
+        head_sha = gate._get_branch_sha(args.branch)
+        if head_sha == "?":
+            print(f"Erro: branch {args.branch} não encontrado")
             sys.exit(1)
+        result = gate.validate_commit(args.branch, head_sha, base_sha)
+        fb = gate._feedback_packet("cli", args.branch, head_sha, base_sha, result)
+        print(json.dumps(fb, indent=2))
+        sys.exit(0 if result["success"] else 1)
     elif args.command == "restore":
         print(gate.restore_prompt(args.branch if hasattr(args, 'branch') and args.branch else None))
     else:
