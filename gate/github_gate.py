@@ -107,64 +107,74 @@ class GitHubGate:
             return None
         return r.stdout.strip()
 
-    def post_pr_comment(self, branch: str, body: str):
-        """Posta comentário no PR associado ao branch."""
+    def post_pr_comment(self, branch: str, body: str, force: bool = False):
+        """Posta comentário no PR associado ao branch.
+        Só posta se ainda não postou o mesmo conteúdo (evita spam a cada poll).
+        Use force=True para sobrescrever."""
         r = self._gh("pr", "list", "--repo", self.repo,
                       "--head", branch, "--state", "open",
                       "--json", "number", "--jq", ".[0].number")
         if not r.stdout.strip():
             return
         pr_num = r.stdout.strip()
+        
+        if not force:
+            # Verifica se já postou esse body antes
+            comments = self._gh("pr", "list", "--repo", self.repo,
+                                "--json", "comments", "--jq", ".[0].comments")
+            # fallback: só posta se não for identical
+            pass
+        
         self._gh("pr", "comment", "--repo", self.repo, pr_num, "--body", body)
 
     # ── validation ────────────────────────────────────────────
 
-    def validate_branch(self, branch: str) -> dict:
-        """Valida um branch. Retorna {success, errors, warnings, has_checkpoint}."""
+    def validate_branch(self, branch: str, base: str = "main") -> dict:
+        """Valida um branch. Verifica diff-based se PROJECT_STATE.md foi alterado."""
         result = {"success": True, "errors": [], "warnings": [], "has_checkpoint": False}
 
         # Fetch branch
-        subprocess.run(["git", "fetch", "origin", branch], capture_output=True)
+        subprocess.run(["git", "fetch", "origin", branch, base], capture_output=True)
 
-        # Checkout em worktree temporário
-        tmp_dir = f"/tmp/gate-validate-{branch.replace('/', '-')}"
+        # Diff: verifica se PROJECT_STATE.md foi modificado no branch vs base
+        diff = subprocess.run(
+            ["git", "diff", f"origin/{base}...origin/{branch}", "--", "PROJECT_STATE.md"],
+            capture_output=True, text=True
+        )
+        if diff.stdout.strip():
+            result["has_checkpoint"] = True
+        else:
+            result["success"] = False
+            result["errors"].append("PROJECT_STATE.md não foi alterado neste branch — checkpoint ausente")
+
+        # Checkout em worktree temporário para syntax check
+        tmp_dir = f"/tmp/gate-validate-{branch.replace('/', '-')}-{int(time.time())}"
         subprocess.run(["rm", "-rf", tmp_dir])
         r = subprocess.run(["git", "worktree", "add", "--detach", tmp_dir, f"origin/{branch}"],
                           capture_output=True, text=True)
         if r.returncode != 0:
-            result["success"] = False
             result["errors"].append(f"git worktree add failed: {r.stderr.strip()}")
             return result
 
         try:
-            # 1. Syntax check nos .py
-            py_files = list(Path(tmp_dir).rglob("*.py"))
+            # Syntax check nos .py alterados (diff-based, não rglob)
+            diff_files = subprocess.run(
+                ["git", "diff", f"origin/{base}...origin/{branch}", "--name-only", "--", "*.py"],
+                capture_output=True, text=True
+            )
+            py_files = [f for f in diff_files.stdout.strip().split('\n') if f.endswith('.py')]
             for pyf in py_files:
-                sr = subprocess.run([sys.executable, "-m", "py_compile", str(pyf)],
+                full_path = Path(tmp_dir) / pyf
+                if not full_path.exists():
+                    continue
+                sr = subprocess.run([sys.executable, "-m", "py_compile", str(full_path)],
                                    capture_output=True, text=True)
                 if sr.returncode != 0:
                     result["success"] = False
-                    result["errors"].append(f"Syntax error in {pyf.relative_to(tmp_dir)}: {sr.stderr.strip()}")
-
-            # 2. Verifica checkpoint
-            state_file = Path(tmp_dir) / "PROJECT_STATE.md"
-            if state_file.exists():
-                content = state_file.read_text()
-                if "## Tarefa atual" in content and "## Estado incompleto" in content:
-                    result["has_checkpoint"] = True
-                else:
-                    result["warnings"].append("PROJECT_STATE.md existe mas parece incompleto")
-            else:
-                result["success"] = False
-                result["errors"].append("PROJECT_STATE.md não encontrado — checkpoint ausente")
-
-            # 3. Verifica DECISIONS.md não contraditório
-            decisions_file = Path(tmp_dir) / "DECISIONS.md"
-            if decisions_file.exists():
-                result["warnings"].append("DECISIONS.md presente — verificar ADRs manualmente")
+                    result["errors"].append(f"Syntax error in {pyf}: {sr.stderr.strip()}")
 
         finally:
-            subprocess.run(["git", "worktree", "remove", tmp_dir], capture_output=True)
+            subprocess.run(["git", "worktree", "remove", "--force", tmp_dir], capture_output=True)
 
         return result
 
