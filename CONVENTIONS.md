@@ -30,3 +30,24 @@ hermes-github-gate/
 - Proibido: saudações, agradecimentos, linguagem prolixa
 - Solicitar resposta no mesmo formato: "Responda: STATUS / DECISAO / PROXIMOS_PASSOS"
 - Aplicável a: ChatGPT, Claude, delegate_task, cronjobs, qualquer sub-agente
+
+## Tiers
+- **TIER_0** — Felipe: autoridade final, decisões de produto, aceitação de risco, merge HIGH_RISK
+- **TIER_1** — ChatGPT / Claude F5: design e revisão apenas. ZERO código.
+- **TIER_2** — Hermes Agent (deepseek-v4-pro): orquestrador local. Interpreta design, gerencia git/gh/PR, executa testes.
+- **TIER_3** — Sub-agente (kimi-k2.7-code:cloud): única entidade que escreve código. Tool calling via Ollama local proxy.
+
+## Planos Transversais
+- **CONTROL PLANE** (Gate): políticas, permissões, máquina de estados, regras de aprovação, allowlists
+- **AUDIT PLANE**: eventos estruturados, logs imutáveis, proveniência, métricas, dados de recuperação
+
+## Regras de Aprovação
+- **LOW_RISK**: 1 Tier 1 approval + testes + CI + Gate
+- **MEDIUM_RISK**: 2 Tier 1 reviews, 0 unresolved blockers
+- **HIGH_RISK**: 2 Tier 1 approvals + TIER_0 explicit authorization + security review
+
+## Bridge
+- **Repositório**: flpccabral/hermes-github-gate (fonte de verdade)
+- **Arquivos de estado**: PROJECT_STATE.md, DECISIONS.md, CONVENTIONS.md, FILEMAP.md
+- **Gate**: gate/github_gate.py (validação SHA-pinned, merge-base, erros estruturados, status retry)
+- **Testes**: tests/unit/ (28 testes, pytest)
