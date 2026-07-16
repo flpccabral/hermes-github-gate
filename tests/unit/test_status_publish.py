@@ -1,48 +1,45 @@
 """Unit tests for status publishing with retries."""
-import subprocess
-from unittest.mock import MagicMock, patch
+import time
+from unittest.mock import MagicMock
 
-from gate.github_gate import GitHubGate
-
-
-class _FakeGate:
-    def __init__(self, max_attempts=3):
-        self.repo = "test/test"
-        self.gh = "gh"
-        self.max_attempts = max_attempts
-        self.attempts = 0
-
-    def set_status(self, head_sha: str, state: str, description: str) -> bool:
-        """Retrying wrapper mirroring the intended publisher contract."""
-        for _attempt in range(self.max_attempts):
-            self.attempts += 1
-            r = self._api_call(head_sha, state, description)
-            if r.returncode == 0:
-                return True
-        return False
-
-    def _api_call(self, head_sha: str, state: str, description: str):
-        return subprocess.run([self.gh, "api", f"repos/{self.repo}/statuses/{head_sha}"],
-                              capture_output=True, text=True)
+import pytest
 
 
-def run_set_status(returncodes):
-    """Call set_status on a retrying publisher and return whether it succeeded."""
-    gate = _FakeGate(max_attempts=len(returncodes))
-    side_effect = [
-        MagicMock(returncode=rc, stdout="", stderr="fail" if rc else "")
-        for rc in returncodes
-    ]
+def _make_gh(side_effects):
+    """Return a fake _gh that returns configured CompletedProcesses in order."""
+    calls = {"count": 0}
 
-    with patch("subprocess.run", side_effect=side_effect) as mocked:
-        result = gate.set_status("sha123", "success", "ok")
-        assert mocked.call_count == len(returncodes)
-    return result
+    def fake_gh(*args, **kwargs):
+        idx = calls["count"]
+        calls["count"] += 1
+        rc = side_effects[idx]
+        return MagicMock(returncode=rc, stdout="", stderr="fail" if rc else "")
 
-
-def test_set_status_true_on_first_success():
-    assert run_set_status([0]) is True
+    return fake_gh, calls
 
 
-def test_set_status_false_after_three_failures():
-    assert run_set_status([1, 1, 1]) is False
+def test_set_status_true_on_first_success(gate, monkeypatch):
+    fake_gh, calls = _make_gh([0])
+    monkeypatch.setattr(gate, "_gh", fake_gh)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+
+    assert gate.set_status("sha123", "success", "ok", max_retries=3) is True
+    assert calls["count"] == 1
+
+
+def test_set_status_true_after_retry(gate, monkeypatch):
+    fake_gh, calls = _make_gh([1, 0])
+    monkeypatch.setattr(gate, "_gh", fake_gh)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+
+    assert gate.set_status("sha123", "success", "ok", max_retries=3) is True
+    assert calls["count"] == 2
+
+
+def test_set_status_false_after_three_failures(gate, monkeypatch):
+    fake_gh, calls = _make_gh([1, 1, 1])
+    monkeypatch.setattr(gate, "_gh", fake_gh)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+
+    assert gate.set_status("sha123", "success", "ok", max_retries=3) is False
+    assert calls["count"] == 3
