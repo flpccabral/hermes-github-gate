@@ -148,60 +148,117 @@ class GitHubGate:
                       "--json", "number", "--jq", ".[0].number")
         return r.stdout.strip() if r.stdout.strip() else None
 
-    def _get_all_comments(self, pr_num: str) -> list[dict]:
-        """Retorna todos os comments do PR (paginação completa)."""
+    def _get_all_comments(self, pr_num: str) -> dict:
+        """Retorna {status, comments, error} com paginação completa.
+        status: 'complete' | 'complete_empty' | 'failed'"""
+        result = {"status": "failed", "comments": [], "error": None}
         comments = []
         page = 1
         while True:
-            r = self._gh("api",
-                f"repos/{self.repo}/issues/{pr_num}/comments?per_page=100&page={page}",
-                "--jq", ".[] | {id, body, created_at, updated_at}")
-            if r.returncode != 0 or not r.stdout.strip():
+            try:
+                r = self._gh("api",
+                    f"repos/{self.repo}/issues/{pr_num}/comments?per_page=100&page={page}",
+                    "--jq", ".[] | {id, body, created_at, updated_at}")
+            except Exception as e:
+                result["error"] = f"API call failed at page {page}: {e}"
+                return result
+            if r.returncode != 0:
+                if page == 1:
+                    result["error"] = f"API error (HTTP {r.returncode}): {r.stderr.strip()[:200]}"
+                    return result
+                # Falha no meio da paginação → resultado parcial inválido
+                result["error"] = f"Paginação incompleta na página {page}: {r.stderr.strip()[:200]}"
+                return result
+            if not r.stdout.strip():
                 break
             for entry in r.stdout.strip().split("\n"):
                 entry = entry.strip()
                 if not entry:
                     continue
                 try:
-                    comments.append(json.loads(entry))
+                    c = json.loads(entry)
+                    if isinstance(c, dict) and "id" in c:
+                        comments.append(c)
                 except json.JSONDecodeError:
                     continue
             if len(r.stdout.strip().split("\n")) < 100:
                 break
             page += 1
-        return comments
+        result["comments"] = comments
+        result["status"] = "complete_empty" if not comments else "complete"
+        return result
 
-    def _find_matching_comments(self, pr_num: str, marker: str) -> list[dict]:
-        """Busca comments que contêm o marcador (paginação)."""
-        return [c for c in self._get_all_comments(pr_num) if marker in c.get("body", "")]
+    def _find_matching_comments(self, pr_num: str, marker: str) -> dict:
+        """Busca comments pelo marcador. Retorna dict com {status, comments, error}."""
+        res = self._get_all_comments(pr_num)
+        if res["status"] != "failed":
+            res["comments"] = [c for c in res["comments"] if marker in c.get("body", "")]
+            if not res["comments"] and res["status"] == "complete":
+                res["status"] = "complete_empty"
+        return res
 
     def _post_or_update(self, branch: str, body: str, fb: dict):
-        """Ponto 1 + Ponto 4: PATCH condicional + convergência concorrente."""
+        """Ponto 1 + Ponto 4: PATCH condicional + convergência concorrente.
+        Correção 1a: verifica status da busca antes de criar/atualizar.
+        Correção 1b: pós-criação relista e converge duplicatas."""
         pr_num = self._get_pr_number(branch)
         if not pr_num:
             return
 
         marker = self._make_marker(fb["head_sha"], fb["base_sha"])
-        matching = self._find_matching_comments(pr_num, marker)
+        res = self._find_matching_comments(pr_num, marker)
 
-        if not matching:
-            # Não existe → criar
-            self._gh("pr", "comment", "--repo", self.repo, pr_num, "--body", body)
+        # Correção 1a: se busca falhou, abortar
+        if res["status"] == "failed":
+            self._log(f"  Erro buscando comentários PR #{pr_num}: {res.get('error', 'desconhecido')}")
             return
 
-        # Ponto 4: convergência — escolher canônico (mais antigo = menor id)
+        matching = res["comments"]
+
+        if not matching:
+            # Correção 1b: criar + relistar + convergir
+            self._log(f"  Criando comentário no PR #{pr_num}")
+            create_r = self._gh("pr", "comment", "--repo", self.repo, pr_num, "--body", body)
+            if create_r.returncode != 0:
+                self._log(f"  Falha ao criar comentário: {create_r.stderr.strip()[:100]}")
+                return
+
+            # Pós-criação: relistar e convergir
+            res2 = self._find_matching_comments(pr_num, marker)
+            if res2["status"] == "failed":
+                self._log(f"  Convergência pós-criação falhou (busca): {res2.get('error','?')}")
+                return
+            all_after = res2["comments"]
+            if len(all_after) <= 1:
+                return  # sem duplicatas
+
+            # Convergir: escolher canônico (menor ID)
+            all_after.sort(key=lambda c: c.get("id", 0))
+            canonical = all_after[0]
+            dups = all_after[1:]
+
+            # Atualizar canônico com resultado atual
+            self._gh("api", f"repos/{self.repo}/issues/comments/{canonical['id']}",
+                     "-X", "PATCH", "-f", f"body={body}")
+
+            # Remover duplicatas
+            for dup in dups:
+                self._gh("api", f"repos/{self.repo}/issues/comments/{dup['id']}",
+                         "-X", "DELETE")
+            self._log(f"  Convergido: {len(dups)} duplicatas removidas")
+            return
+
+        # Já existe comentário: PATCH condicional
         matching.sort(key=lambda c: c.get("id", 0))
         canonical = matching[0]
         duplicates = matching[1:]
 
-        # Ponto 1: PATCH condicional — comparar projeção semântica
         existing_fb = self._extract_fb_from_body(canonical.get("body", ""))
         if existing_fb:
             old_proj = self._semantic_projection(existing_fb)
             new_proj = self._semantic_projection(fb)
             if old_proj == new_proj:
-                # Semanticamente igual → não faz PATCH
-                # Mas ainda remove duplicatas se houver
+                # Semanticamente igual → não faz PATCH, só remove duplicatas
                 for dup in duplicates:
                     self._gh("api", f"repos/{self.repo}/issues/comments/{dup['id']}",
                              "-X", "DELETE")
@@ -211,7 +268,6 @@ class GitHubGate:
         self._gh("api", f"repos/{self.repo}/issues/comments/{canonical['id']}",
                  "-X", "PATCH", "-f", f"body={body}")
 
-        # Depois de atualizar, remover duplicatas
         for dup in duplicates:
             self._gh("api", f"repos/{self.repo}/issues/comments/{dup['id']}",
                      "-X", "DELETE")
@@ -249,7 +305,21 @@ class GitHubGate:
                  "-f", f"context=hermes-gate/validate",
                  "-f", f"description={description}")
 
-    # ── merge-base (Ponto 2 + Ponto 3) ────────────────────────
+    # ── merge-base (Ponto 2 + Ponto 3 + Ponto 4) ──────────────
+
+    def _classify_merge_base(self, all_mb: list[str], is_shallow: bool,
+                             unshallow_attempted: bool) -> tuple:
+        """Classificador ÚNICO de merge-base. Retorna (sha or None, error_code or None)."""
+        if len(all_mb) == 0:
+            if unshallow_attempted:
+                return None, "HISTORY_INCOMPLETE"
+            if is_shallow:
+                return None, "HISTORY_INCOMPLETE"
+            return None, "UNRELATED_HISTORIES"
+        if len(all_mb) == 1:
+            return all_mb[0], None
+        # >1
+        return None, "AMBIGUOUS_MERGE_BASE"
 
     def _resolve_merge_base(self, branch: str, head_sha: str, base_sha: str,
                             result: dict) -> Optional[str]:
@@ -274,46 +344,62 @@ class GitHubGate:
                 result["errors"].append(f"commit {label} ({sha[:12]}) não encontrado localmente")
                 return None
 
-        # Ponto 2: git merge-base --all
-        try:
-            r = self._git("merge-base", "--all", base_sha, head_sha, timeout=15)
-        except subprocess.TimeoutExpired:
-            result["success"] = False
-            result["errors"].append("git merge-base timed out")
-            return None
-
-        if r.returncode != 0:
-            # Ponto 3: classificar falha
-            shallow = self._git("rev-parse", "--is-shallow-repository")
-            if shallow.returncode == 0 and shallow.stdout.strip() == "true":
-                # Tenta unshallow
-                u = self._git("fetch", "--unshallow", timeout=60)
-                if u.returncode == 0:
-                    # Re-tenta merge-base
-                    r2 = self._git("merge-base", "--all", base_sha, head_sha, timeout=15)
-                    if r2.returncode == 0 and r2.stdout.strip():
-                        all_mb = [s.strip() for s in r2.stdout.strip().split("\n") if s.strip()]
-                        if len(all_mb) == 1:
-                            return all_mb[0]
+        # Função auxiliar: executa merge-base --all e classifica
+        def _run_and_classify(already_unshallowed: bool = False) -> Optional[str]:
+            try:
+                r = self._git("merge-base", "--all", base_sha, head_sha, timeout=15)
+            except subprocess.TimeoutExpired:
                 result["success"] = False
-                result["errors"].append("MERGE_BASE_HISTORY_INCOMPLETE — histórico raso, unshallow falhou")
-            else:
+                result["errors"].append("git merge-base timed out")
+                return None
+
+            if r.returncode != 0:
+                # Correção 4: classificar falha — verificar shallow primeiro
+                shallow_r = self._git("rev-parse", "--is-shallow-repository")
+                if shallow_r.returncode != 0:
+                    # Falha ao detectar shallow — não prova UNRELATED
+                    result["success"] = False
+                    result["errors"].append("REPOSITORY_TYPE_UNKNOWN — falha ao determinar tipo do repositório")
+                    return None
+
+                is_shallow = shallow_r.stdout.strip() == "true"
+
+                if is_shallow and not already_unshallowed:
+                    # Correção 3: capturar timeout do unshallow
+                    try:
+                        u = self._git("fetch", "--unshallow", timeout=60)
+                    except subprocess.TimeoutExpired:
+                        result["success"] = False
+                        result["errors"].append("UNSHALLOW_TIMEOUT — unshallow excedeu 60s")
+                        return None
+                    if u.returncode == 0:
+                        return _run_and_classify(already_unshallowed=True)
+                    result["success"] = False
+                    result["errors"].append("HISTORY_INCOMPLETE — unshallow falhou")
+                    return None
+
+                # Classificador único
+                sha, err = self._classify_merge_base([], is_shallow, already_unshallowed)
+                if err:
+                    result["success"] = False
+                    result["errors"].append(err)
+                return sha
+
+            # merge-base --all OK: normalizar e classificar
+            all_mb_raw = [s.strip() for s in r.stdout.strip().split("\n") if s.strip()]
+            all_mb = list(dict.fromkeys(all_mb_raw))  # dedup mantendo ordem
+
+            # Determinar shallow state para classificação
+            shallow_r = self._git("rev-parse", "--is-shallow-repository")
+            is_shallow = (shallow_r.returncode == 0 and shallow_r.stdout.strip() == "true")
+
+            sha, err = self._classify_merge_base(all_mb, is_shallow, already_unshallowed)
+            if err:
                 result["success"] = False
-                result["errors"].append("UNRELATED_HISTORIES — branch e base sem ancestral comum")
-            return None
+                result["errors"].append(err)
+            return sha
 
-        # Ponto 2: contar resultados
-        all_mb = [s.strip() for s in r.stdout.strip().split("\n") if s.strip()]
-        if len(all_mb) == 0:
-            result["success"] = False
-            result["errors"].append("MERGE_BASE_HISTORY_INCOMPLETE — merge-base vazio")
-            return None
-        if len(all_mb) > 1:
-            result["success"] = False
-            result["errors"].append(f"AMBIGUOUS_MERGE_BASE — {len(all_mb)} merge-bases encontrados (topologia não suportada no L1)")
-            return None
-
-        return all_mb[0]
+        return _run_and_classify()
 
     # ── validation ────────────────────────────────────────────
 
@@ -431,9 +517,11 @@ class GitHubGate:
             if pr_num:
                 marker_prefix = "<!-- hermes-gate:"
                 last_gate = None
-                for c in self._get_all_comments(pr_num):
-                    if marker_prefix in c.get("body", ""):
-                        last_gate = c["body"]
+                res = self._get_all_comments(pr_num)
+                if res["status"] != "failed":
+                    for c in res["comments"]:
+                        if marker_prefix in c.get("body", ""):
+                            last_gate = c["body"]
                 if last_gate:
                     parts.append("=== ÚLTIMO FEEDBACK DO GATE ===\n" + last_gate)
 
