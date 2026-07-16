@@ -1,29 +1,28 @@
-# PROJECT STATE — atualizado 2026-07-16T19:05Z por tier3/hermes
+# PROJECT STATE — atualizado 2026-07-16T19:30Z por tier3/hermes
 ## Objetivo
-GitHub Gate L1 — validação SHA-fixo, fail-closed completo, Feedback Packet v2.
+GitHub Gate L1 — validação SHA-pinned, merge-base determinístico, erros estruturados.
 
-## Tarefa atual
-Correções baseadas no veredito do ChatGPT (2º juiz).
+## Entregue
+- gate/github_gate.py: poll branches ai/*, validação SHA fixa, merge-base --all, checkpoint diff-based, PRs, status check com retry, comments idempotentes (PATCH condicional), Feedback Packet, erros estruturados (_ERROR_MAP, códigos semânticos)
+- checkpoint/checkpoint.py: save/restore stdlib
+- .github/ISSUE_TEMPLATE/task.md: template de issues (pendente poll_issues em PR futuro)
 
-## Correções aplicadas
-1. TOCTOU eliminado: head_sha e base_sha fixados ANTES da validação
-2. set_status() usa head_sha recebido (nunca consulta branch de novo)
-3. git fetch com verificação de returncode
-4. git diff com verificação de returncode
-5. cat-file -e confirma que commits existem localmente
-6. Dedup por marcador estruturado: <!-- hermes-gate:feedback:run_id:head_sha:base_sha:status:end -->
-7. Feedback Packet v2: schema_version, overall_status (passed/failed/infra_error), run_id
-8. pytest removido (volta em PR futuro com sandbox)
-9. Warnings não silenciam erros de infraestrutura
-10. restore() busca só comentários DO GATE (marcados)
+## Marcador de comentário (atual)
+<!-- hermes-gate:L1-v1:HEAD_SHA:BASE_SHA:end -->
+(Determinístico: versão + head_sha + base_sha. NÃO contém run_id.)
 
-## Próximas ações
-1. Smoke test do L1 corrigido
-2. Reportar para ChatGPT+Claude revisarem
-3. Merge se aprovado
+## Erros estruturados
+- _make_error(code, msg) → {code, message, category, retryable}
+- _ERROR_MAP: 19 códigos com (categoria, retryable, next_action)
+- category ∈ {code, infra, policy, unsupported}
+- INFRA_CODES usado apenas para compatibilidade
 
-## Bloqueadores anteriores (resolvidos)
-- R1 (spam): ✅ Dedup por marcador estruturado, não por body
-- R2 (fail-closed): ✅ git fetch + git diff verificam returncode
-- R3 (checkpoint): ✅ PROJECT_STATE.md atualizado
-- TOCTOU: ✅ SHA fixado antes da validação
+## PR #3
+- Head: 9e52e2f
+- Título: "feat: L1 - validacao SHA-pinned, merge-base deterministico, erros estruturados"
+- Status: aguardando revisão final
+
+## Decisões registradas
+- 001: GitHub Gate como arquitetura de bridge
+- 002: Responsabilidades por tier (Claude projeta, Hermes orquestra, sub-agent codifica)
+- 003: Formato IA-IA em toda comunicação entre agentes

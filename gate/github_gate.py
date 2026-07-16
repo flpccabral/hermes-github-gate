@@ -135,11 +135,15 @@ class GitHubGate:
 
         # next_action do primeiro erro com mapeamento (ou genérico)
         first_err = None
-        for e in result.get("errors", []):
-            meta = self._ERROR_MAP.get(e.get("code", ""))
-            if meta:
-                first_err = meta[2]
-                break
+        # B2: publication_status=failed tem precedência
+        if publication_status == "failed":
+            first_err = "retry_status_publish"
+        else:
+            for e in result.get("errors", []):
+                meta = self._ERROR_MAP.get(e.get("code", ""))
+                if meta:
+                    first_err = meta[2]
+                    break
         if not first_err:
             first_err = {"passed": "merge", "passed_with_warnings": "review_warnings",
                         "failed": "fix_code", "infra_error": "retry"}.get(overall, "unknown")
@@ -452,7 +456,7 @@ class GitHubGate:
                 sha, err = self._classify_merge_base([], is_shallow_now)
                 if err:
                     result["success"] = False
-                    result["errors"].append(_make_error(err, err, "infra", True))
+                    result["errors"].append(_make_error(err, err))
                 return sha
 
             # merge-base --all OK: normalizar e classificar
@@ -466,7 +470,7 @@ class GitHubGate:
             sha, err = self._classify_merge_base(all_mb, is_shallow)
             if err:
                 result["success"] = False
-                result["errors"].append(_make_error(err, err, "infra", True))
+                result["errors"].append(_make_error(err, err))
             return sha
 
         return _run_and_classify()
