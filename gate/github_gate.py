@@ -222,8 +222,8 @@ class GitHubGate:
             else:
                 self.set_status(name, "failure", "; ".join(result["errors"][:2]))
 
-            # Cria PR se passou na validação
-            if result["success"] and not self.has_open_pr(name):
+            # Cria PR sempre (mesmo em falha — feedback pro tier web)
+            if not self.has_open_pr(name):
                 pr_url = self.create_pr(name)
                 if pr_url:
                     self._log(f"    PR criado: {pr_url}")
