@@ -19,9 +19,16 @@ INFRA_CODES = {"HISTORY_INCOMPLETE", "UNSHALLOW_TIMEOUT", "REPOSITORY_TYPE_UNKNO
                "AMBIGUOUS_MERGE_BASE", "COMMENT_LIST_PARSE_FAILED",
                "STATUS_PUBLISH_FAILED", "STATUS_PUBLISH_RETRIES_EXHAUSTED"}
 
-def _make_error(code: str, message: str, category: str = "code",
-                retryable: bool = False) -> dict:
-    """Cria erro estruturado com código semântico preservado."""
+def _make_error(code: str, message: str, category: str = None,
+                retryable: bool = None) -> dict:
+    """Cria erro estruturado com código semântico preservado.
+    Se category/retryable nao fornecidos, consulta _ERROR_MAP."""
+    if category is None or retryable is None:
+        meta = GitHubGate._ERROR_MAP.get(code, ("code", False, "fix_code"))
+        if category is None:
+            category = meta[0]
+        if retryable is None:
+            retryable = meta[1]
     return {"code": code, "message": message,
             "category": category, "retryable": retryable}
 
@@ -123,8 +130,19 @@ class GitHubGate:
                   "passed_with_warnings" if result["warnings"] else "passed"
 
         # Se publicação do status falhou, eleva para infra_error
-        if publication_status == "failed" and overall in ("passed", "passed_with_warnings"):
+        if publication_status == "failed":
             overall = "infra_error"
+
+        # next_action do primeiro erro com mapeamento (ou genérico)
+        first_err = None
+        for e in result.get("errors", []):
+            meta = self._ERROR_MAP.get(e.get("code", ""))
+            if meta:
+                first_err = meta[2]
+                break
+        if not first_err:
+            first_err = {"passed": "merge", "passed_with_warnings": "review_warnings",
+                        "failed": "fix_code", "infra_error": "retry"}.get(overall, "unknown")
 
         return {
             "schema_version": "1.0", "run_id": run_id,
@@ -133,11 +151,10 @@ class GitHubGate:
             "head_sha": head_sha, "base_sha": base_sha, "merge_base_sha": merge_base_sha,
             "overall_status": overall,
             "checkpoint_present": result.get("has_checkpoint", False),
-            "errors": result.get("errors", []),  # códigos semânticos preservados
+            "errors": result.get("errors", []),
             "warnings": result.get("warnings", []),
             "publication_status": publication_status,
-            "next_action": {"passed": "merge", "passed_with_warnings": "review_warnings",
-                           "failed": "fix_code", "infra_error": "retry"}.get(overall, "unknown"),
+            "next_action": first_err,
             "timestamps": {"poll_utc": datetime.datetime.utcnow().isoformat() + "Z"},
         }
 
@@ -352,6 +369,26 @@ class GitHubGate:
         # >1
         return None, "AMBIGUOUS_MERGE_BASE"
 
+    # Mapa: codigo_erro → (categoria, retryable, next_action)
+    _ERROR_MAP = {
+        "HISTORY_INCOMPLETE":         ("infra", True, "retry_history_fetch"),
+        "UNSHALLOW_TIMEOUT":          ("infra", True, "retry_unshallow"),
+        "REPOSITORY_TYPE_UNKNOWN":    ("infra", True, "inspect_repository"),
+        "UNRELATED_HISTORIES":        ("policy", False, "recreate_branch"),
+        "AMBIGUOUS_MERGE_BASE":       ("unsupported", False, "unsupported_topology"),
+        "STATUS_PUBLISH_FAILED":      ("infra", True, "retry_status_publish"),
+        "STATUS_PUBLISH_RETRIES_EXHAUSTED": ("infra", True, "retry_status_publish"),
+        "COMMENT_LIST_PARSE_FAILED":  ("infra", True, "retry"),
+        "FETCH_TIMEOUT":              ("infra", True, "retry"),
+        "FETCH_FAILED":               ("infra", True, "retry"),
+        "COMMIT_NOT_FOUND":           ("infra", True, "retry"),
+        "MERGE_BASE_TIMEOUT":         ("infra", True, "retry"),
+        "GIT_DIFF_FAILED":            ("infra", True, "retry"),
+        "WORKTREE_FAILED":            ("infra", True, "retry"),
+        "CHECKPOINT_MISSING":         ("code", False, "fix_checkpoint"),
+        "SYNTAX_ERROR":               ("code", False, "fix_code"),
+    }
+
     def _resolve_merge_base(self, branch: str, head_sha: str, base_sha: str,
                             result: dict) -> Optional[str]:
         """Fetch, calcula merge-base com --all, classifica falhas. Retorna SHA ou None."""
@@ -406,7 +443,7 @@ class GitHubGate:
                     if u.returncode == 0:
                         return _run_and_classify(already_unshallowed=True)
                     result["success"] = False
-                    result["errors"].append(_make_error("HISTORY_INCOMPLETE", "HISTORY_INCOMPLETE — unshallow falhou", "infra", True))
+                    result["errors"].append(_make_error("HISTORY_INCOMPLETE", "HISTORY_INCOMPLETE — unshallow falhou"))
                     return None
 
                 # Classificador único (re-verifica shallow state atual)
@@ -516,10 +553,16 @@ class GitHubGate:
                 status_ok = self.set_status(head_sha, "success", "Validação OK")
             elif not result["success"]:
                 err_msg = result["errors"][0].get("message", str(result["errors"][0]))[:80] if result["errors"] else "unknown"
-                is_infra = any(e.get("code") in INFRA_CODES for e in result.get("errors", []))
+                is_infra = any(e.get("category") == "infra" for e in result.get("errors", []))
                 status_ok = self.set_status(head_sha, "error" if is_infra else "failure", err_msg)
             else:
                 status_ok = self.set_status(head_sha, "success", "OK (warnings)")
+
+            # Se status falhou, adiciona erro estruturado
+            if not status_ok:
+                result.setdefault("errors", []).append(
+                    _make_error("STATUS_PUBLISH_RETRIES_EXHAUSTED",
+                                f"Status publish failed after retries for {head_sha[:12]}"))
 
             # 3. Gerar feedback packet (com publication_status)
             publication_status = "confirmed" if status_ok else "failed"
