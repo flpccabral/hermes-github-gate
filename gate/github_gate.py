@@ -14,6 +14,17 @@ STATE_FILES = ["PROJECT_STATE.md", "DECISIONS.md", "CONVENTIONS.md", "FILEMAP.md
 BRANCH_PREFIX = "ai/"
 VALIDATOR_VERSION = "L1-v1"
 
+# Códigos de erro conhecidos como infraestrutura (por code, não substring)
+INFRA_CODES = {"HISTORY_INCOMPLETE", "UNSHALLOW_TIMEOUT", "REPOSITORY_TYPE_UNKNOWN",
+               "AMBIGUOUS_MERGE_BASE", "COMMENT_LIST_PARSE_FAILED",
+               "STATUS_PUBLISH_FAILED", "STATUS_PUBLISH_RETRIES_EXHAUSTED"}
+
+def _make_error(code: str, message: str, category: str = "code",
+                retryable: bool = False) -> dict:
+    """Cria erro estruturado com código semântico preservado."""
+    return {"code": code, "message": message,
+            "category": category, "retryable": retryable}
+
 # Campos ignorados na comparação semântica
 _SEMANTIC_SKIP = {"run_id", "timestamps", "schema_version"}
 
@@ -100,28 +111,20 @@ class GitHubGate:
 
     # ── Feedback Packet ──────────────────────────────────────
 
-    # Códigos de erro conhecidos como infraestrutura (não substring)
-    _INFRA_CODES = {"HISTORY_INCOMPLETE", "UNSHALLOW_TIMEOUT", "REPOSITORY_TYPE_UNKNOWN",
-                    "AMBIGUOUS_MERGE_BASE", "COMMENT_LIST_PARSE_FAILED"}
-
     def _feedback_packet(self, run_id: str, branch: str,
                          head_sha: str, base_sha: str, merge_base_sha: str,
-                         result: dict) -> dict:
-        # Detecta infra por código do erro, não por substring da mensagem
-        infra = False
-        errors_structured = []
-        for i, e in enumerate(result.get("errors", [])):
-            code = f"ERR{i:02d}"
-            msg = str(e)
-            # Verifica se a mensagem começa com um código conhecido
-            is_infra = any(msg.startswith(ic) for ic in self._INFRA_CODES)
-            errors_structured.append({"code": code, "message": msg})
-            if is_infra:
-                infra = True
+                         result: dict, publication_status: str = "confirmed") -> dict:
+        # Usa erros estruturados diretamente (códigos semânticos preservados)
+        infra = any(e.get("code") in INFRA_CODES or e.get("category") == "infra"
+                    for e in result.get("errors", []))
 
         overall = "infra_error" if (not result["success"] and infra) else \
                   "failed" if not result["success"] else \
                   "passed_with_warnings" if result["warnings"] else "passed"
+
+        # Se publicação do status falhou, eleva para infra_error
+        if publication_status == "failed" and overall in ("passed", "passed_with_warnings"):
+            overall = "infra_error"
 
         return {
             "schema_version": "1.0", "run_id": run_id,
@@ -130,9 +133,9 @@ class GitHubGate:
             "head_sha": head_sha, "base_sha": base_sha, "merge_base_sha": merge_base_sha,
             "overall_status": overall,
             "checkpoint_present": result.get("has_checkpoint", False),
-            "errors": errors_structured,
-            "warnings": [{"code": f"WRN{i:02d}", "message": w}
-                        for i, w in enumerate(result.get("warnings", []))],
+            "errors": result.get("errors", []),  # códigos semânticos preservados
+            "warnings": result.get("warnings", []),
+            "publication_status": publication_status,
             "next_action": {"passed": "merge", "passed_with_warnings": "review_warnings",
                            "failed": "fix_code", "infra_error": "retry"}.get(overall, "unknown"),
             "timestamps": {"poll_utc": datetime.datetime.utcnow().isoformat() + "Z"},
@@ -319,11 +322,20 @@ class GitHubGate:
                       "--body", f"🤖 PR automático do branch `{branch}`.")
         return r.stdout.strip() if r.returncode == 0 else None
 
-    def set_status(self, head_sha: str, state: str, description: str):
-        self._gh("api", f"repos/{self.repo}/statuses/{head_sha}",
-                 "-f", f"state={state}",
-                 "-f", f"context=hermes-gate/validate",
-                 "-f", f"description={description}")
+    def set_status(self, head_sha: str, state: str, description: str, max_retries: int = 3) -> bool:
+        """Publica status no SHA validado. Com retry. Retorna True se confirmado."""
+        import time as _time
+        for attempt in range(max_retries):
+            if attempt > 0:
+                _time.sleep(1 * attempt)  # backoff simples
+            r = self._gh("api", f"repos/{self.repo}/statuses/{head_sha}",
+                     "-f", f"state={state}",
+                     "-f", f"context=hermes-gate/validate",
+                     "-f", f"description={description}")
+            if r.returncode == 0:
+                return True
+        self._log(f"  Status publish FAILED after {max_retries} retries: {description}")
+        return False
 
     # ── merge-base (Ponto 2 + Ponto 3 + Ponto 4) ──────────────
 
@@ -349,18 +361,18 @@ class GitHubGate:
                 r = self._git("fetch", "origin", ref, timeout=30)
             except subprocess.TimeoutExpired:
                 result["success"] = False
-                result["errors"].append(f"git fetch {label} timed out")
+                result["errors"].append(_make_error("FETCH_TIMEOUT", f"git fetch {label} timed out", "infra", True))
                 return None
             if r.returncode != 0:
                 result["success"] = False
-                result["errors"].append(f"git fetch {label} failed")
+                result["errors"].append(_make_error("FETCH_FAILED", f"git fetch {label} failed", "infra", True))
                 return None
 
         # Confirma SHAs localmente
         for sha, label in [(head_sha, "head"), (base_sha, "base")]:
             if self._git("cat-file", "-e", sha).returncode != 0:
                 result["success"] = False
-                result["errors"].append(f"commit {label} ({sha[:12]}) não encontrado localmente")
+                result["errors"].append(_make_error("COMMIT_NOT_FOUND", f"commit {label} ({sha[:12]}) não encontrado localmente", "infra", True))
                 return None
 
         # Função auxiliar: executa merge-base --all e classifica
@@ -369,7 +381,7 @@ class GitHubGate:
                 r = self._git("merge-base", "--all", base_sha, head_sha, timeout=15)
             except subprocess.TimeoutExpired:
                 result["success"] = False
-                result["errors"].append("git merge-base timed out")
+                result["errors"].append(_make_error("MERGE_BASE_TIMEOUT", "git merge-base timed out", "infra", True))
                 return None
 
             if r.returncode != 0:
@@ -378,7 +390,7 @@ class GitHubGate:
                 if shallow_r.returncode != 0:
                     # Falha ao detectar shallow — não prova UNRELATED
                     result["success"] = False
-                    result["errors"].append("REPOSITORY_TYPE_UNKNOWN — falha ao determinar tipo do repositório")
+                    result["errors"].append(_make_error("REPOSITORY_TYPE_UNKNOWN", "REPOSITORY_TYPE_UNKNOWN — falha ao determinar tipo do repositório", "infra", True))
                     return None
 
                 is_shallow = shallow_r.stdout.strip() == "true"
@@ -389,12 +401,12 @@ class GitHubGate:
                         u = self._git("fetch", "--unshallow", timeout=60)
                     except subprocess.TimeoutExpired:
                         result["success"] = False
-                        result["errors"].append("UNSHALLOW_TIMEOUT — unshallow excedeu 60s")
+                        result["errors"].append(_make_error("UNSHALLOW_TIMEOUT", "UNSHALLOW_TIMEOUT — unshallow excedeu 60s", "infra", True))
                         return None
                     if u.returncode == 0:
                         return _run_and_classify(already_unshallowed=True)
                     result["success"] = False
-                    result["errors"].append("HISTORY_INCOMPLETE — unshallow falhou")
+                    result["errors"].append(_make_error("HISTORY_INCOMPLETE", "HISTORY_INCOMPLETE — unshallow falhou", "infra", True))
                     return None
 
                 # Classificador único (re-verifica shallow state atual)
@@ -403,7 +415,7 @@ class GitHubGate:
                 sha, err = self._classify_merge_base([], is_shallow_now)
                 if err:
                     result["success"] = False
-                    result["errors"].append(err)
+                    result["errors"].append(_make_error(err, err, "infra", True))
                 return sha
 
             # merge-base --all OK: normalizar e classificar
@@ -417,7 +429,7 @@ class GitHubGate:
             sha, err = self._classify_merge_base(all_mb, is_shallow)
             if err:
                 result["success"] = False
-                result["errors"].append(err)
+                result["errors"].append(_make_error(err, err, "infra", True))
             return sha
 
         return _run_and_classify()
@@ -431,27 +443,26 @@ class GitHubGate:
         r = self._git("diff", merge_base_sha, head_sha, "--", "PROJECT_STATE.md")
         if r.returncode != 0:
             result["success"] = False
-            result["errors"].append(f"git diff checkpoint failed: {r.stderr.strip()}")
+            result["errors"].append(_make_error("GIT_DIFF_FAILED", f"git diff checkpoint failed: {r.stderr.strip()}", "infra", True))
             return result
         if r.stdout.strip():
             result["has_checkpoint"] = True
         else:
             result["success"] = False
-            result["errors"].append("PROJECT_STATE.md não foi alterado — checkpoint ausente")
+            result["errors"].append(_make_error("CHECKPOINT_MISSING", "PROJECT_STATE.md não foi alterado — checkpoint ausente", "code", False))
 
         tmp_dir = f"/tmp/gate-v4-{uuid.uuid4().hex[:8]}"
         subprocess.run(["rm", "-rf", tmp_dir])
         r = self._git("worktree", "add", "--detach", tmp_dir, head_sha)
         if r.returncode != 0:
             result["success"] = False
-            result["errors"].append(f"git worktree add failed: {r.stderr.strip()}")
+            result["errors"].append(_make_error("WORKTREE_FAILED", f"git worktree add failed: {r.stderr.strip()}", "infra", True))
             return result
-
         try:
             r = self._git("diff", merge_base_sha, head_sha, "--name-only", "--", "*.py")
             if r.returncode != 0:
                 result["success"] = False
-                result["errors"].append(f"git diff py files failed: {r.stderr.strip()}")
+                result["errors"].append(_make_error("GIT_DIFF_FAILED", f"git diff py files failed: {r.stderr.strip()}", "infra", True))
                 return result
             for pyf in [f for f in r.stdout.strip().split('\n') if f.endswith('.py')]:
                 fp = Path(tmp_dir) / pyf
@@ -461,7 +472,7 @@ class GitHubGate:
                                    capture_output=True, text=True)
                 if sr.returncode != 0:
                     result["success"] = False
-                    result["errors"].append(f"Syntax error in {pyf}: {sr.stderr.strip()}")
+                    result["errors"].append(_make_error("SYNTAX_ERROR", f"Syntax error in {pyf}: {sr.stderr.strip()}", "code", False))
         finally:
             self._git("worktree", "remove", "--force", tmp_dir)
 
@@ -488,33 +499,44 @@ class GitHubGate:
 
             self._log(f"  → {name} head={head_sha[:12]} base={base_sha[:12]}")
 
-            # Merge-base + fetch
+            # 1. Validar (merge-base + fetch)
             ctx = {"success": True, "errors": [], "warnings": [], "has_checkpoint": False}
             merge_base_sha = self._resolve_merge_base(name, head_sha, base_sha, ctx)
 
             if merge_base_sha is None:
-                fb = self._feedback_packet(run_id, name, head_sha, base_sha, "", ctx)
-                self.set_status(head_sha, "error", "; ".join(ctx["errors"][:2]))
+                result = ctx
+                merge_base_sha_val = ""
             else:
                 self._log(f"    merge-base={merge_base_sha[:12]}")
                 result = self.validate_commit(name, head_sha, base_sha, merge_base_sha)
-                fb = self._feedback_packet(run_id, name, head_sha, base_sha, merge_base_sha, result)
+                merge_base_sha_val = merge_base_sha
 
-                if fb["overall_status"] in ("passed", "passed_with_warnings"):
-                    self.set_status(head_sha, "success", f"{fb['overall_status']}")
-                elif fb["overall_status"] == "infra_error":
-                    self.set_status(head_sha, "error", "; ".join(result["errors"][:2]))
-                else:
-                    self.set_status(head_sha, "failure", "; ".join(result["errors"][:2]))
+            # 2. Publicar status (com retry) — ANTES de comentário e PR
+            if result["success"] and result.get("has_checkpoint"):
+                status_ok = self.set_status(head_sha, "success", "Validação OK")
+            elif not result["success"]:
+                err_msg = result["errors"][0].get("message", str(result["errors"][0]))[:80] if result["errors"] else "unknown"
+                is_infra = any(e.get("code") in INFRA_CODES for e in result.get("errors", []))
+                status_ok = self.set_status(head_sha, "error" if is_infra else "failure", err_msg)
+            else:
+                status_ok = self.set_status(head_sha, "success", "OK (warnings)")
 
-            if not self._get_pr_number(name):
+            # 3. Gerar feedback packet (com publication_status)
+            publication_status = "confirmed" if status_ok else "failed"
+            fb = self._feedback_packet(run_id, name, head_sha, base_sha,
+                                       merge_base_sha_val, result, publication_status)
+
+            # 4. Sincronizar comentário (só se status confirmado ou já existe PR)
+            existing_pr = self._get_pr_number(name)
+            if existing_pr:
+                comment_body = self._format_comment(fb)
+                self._post_or_update(name, comment_body, fb)
+
+            # 5. Criar PR apenas se status foi confirmado
+            if status_ok and not existing_pr:
                 pr_url = self.create_pr(name)
                 if pr_url:
                     self._log(f"    PR criado: {pr_url}")
-
-            # Ponto 1 + Ponto 4: PATCH condicional + convergência
-            comment_body = self._format_comment(fb)
-            self._post_or_update(name, comment_body, fb)
 
     def poll_loop(self, interval: int = 60):
         while True:
