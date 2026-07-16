@@ -1,20 +1,9 @@
 #!/usr/bin/env python3
 """
-github_gate.py — Hermes GitHub Gate L1 (v3 - dedup determinístico + merge-base)
+github_gate.py — Hermes GitHub Gate L1 (v4 - PATCH condicional + merge-base --all)
 
 Bridge entre web AIs (Claude/ChatGPT via GitHub) e execução local.
 Polla branches ai/*, valida por merge-base fixo, abre PRs, seta status.
-
-Uso CLI:
-    python github_gate.py poll --once
-    python github_gate.py poll --watch
-    python github_gate.py restore [--branch <name>]
-    python github_gate.py pr-validate <branch>
-
-Uso como plugin Hermes:
-    from gate.github_gate import GitHubGate
-    gate = GitHubGate()
-    gate.poll_once()
 """
 import argparse, datetime, hashlib, json, os, subprocess, sys, time, uuid
 from typing import Optional
@@ -25,10 +14,11 @@ STATE_FILES = ["PROJECT_STATE.md", "DECISIONS.md", "CONVENTIONS.md", "FILEMAP.md
 BRANCH_PREFIX = "ai/"
 VALIDATOR_VERSION = "L1-v1"
 
+# Campos ignorados na comparação semântica
+_SEMANTIC_SKIP = {"run_id", "timestamps", "schema_version"}
+
 
 class GitHubGate:
-    """GitHub Gate: monitora branches ai/* com validação por SHA fixo."""
-
     def __init__(self, repo: str = REPO, gh_cmd: str = "gh"):
         self.repo = repo
         self.gh = gh_cmd
@@ -50,41 +40,75 @@ class GitHubGate:
 
     def _repo_api(self, path: str) -> dict:
         r = self._gh("api", f"repos/{self.repo}/{path}")
-        if r.returncode != 0:
-            return {}
-        return json.loads(r.stdout) if r.stdout.strip() else {}
+        return json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else {}
 
     def _get_branch_sha(self, branch: str) -> str:
         data = self._repo_api(f"branches/{branch}")
         return data.get("commit", {}).get("sha", "?")
 
     def _git(self, *args, timeout=60, **kwargs) -> subprocess.CompletedProcess:
-        cmd = ["git"] + [str(a) for a in args]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kwargs)
-        return r
+        return subprocess.run(["git"] + [str(a) for a in args],
+                              capture_output=True, text=True, timeout=timeout, **kwargs)
 
-    # ── Feedback Packet ──────────────────────────────────────
+    # ── marcador determinístico ─────────────────────────────
 
     def _make_marker(self, head_sha: str, base_sha: str) -> str:
-        """Marcador determinístico: depende só de head+base, NÃO de run_id."""
         return f"<!-- hermes-gate:{VALIDATOR_VERSION}:{head_sha}:{base_sha}:end -->"
 
-    def _semantic_key(self, result: dict) -> str:
-        """Hash do RESULTADO SEMÂNTICO (ignora timestamps, run_id)."""
-        payload = f"{result.get('success')}:{result.get('has_checkpoint')}:{result.get('errors', [])}:{result.get('warnings', [])}"
-        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+    # ── projeção semântica (Ponto 1) ─────────────────────────
+
+    def _semantic_projection(self, fb: dict) -> str:
+        """Projeção canônica: só campos que representam o resultado funcional.
+        Ignora run_id, timestamps, etc. Saída determinística p/ comparação."""
+        errors_norm = sorted(
+            (e.get("code", ""), e.get("message", "")) for e in fb.get("errors", [])
+        )
+        warnings_norm = sorted(
+            (w.get("code", ""), w.get("message", "")) for w in fb.get("warnings", [])
+        )
+        payload = json.dumps({
+            "validator_version": fb.get("validator_version", ""),
+            "branch": fb.get("branch", ""),
+            "head_sha": fb.get("head_sha", ""),
+            "base_sha": fb.get("base_sha", ""),
+            "merge_base_sha": fb.get("merge_base_sha", ""),
+            "overall_status": fb.get("overall_status", ""),
+            "checkpoint_present": fb.get("checkpoint_present", False),
+            "next_action": fb.get("next_action", ""),
+            "errors": errors_norm,
+            "warnings": warnings_norm,
+        }, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode()).hexdigest()[:32]
+
+    def _extract_fb_from_body(self, body: str) -> Optional[dict]:
+        """Extrai Feedback Packet do corpo do comentário."""
+        for line in body.split("\n"):
+            line = line.strip()
+            if line.startswith("{") and line.endswith("}"):
+                try:
+                    return json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+        # Tenta extrair de bloco ```json
+        if "```json" in body:
+            block = body.split("```json")[1].split("```")[0].strip()
+            try:
+                return json.loads(block)
+            except json.JSONDecodeError:
+                pass
+        return None
+
+    # ── Feedback Packet ──────────────────────────────────────
 
     def _feedback_packet(self, run_id: str, branch: str,
                          head_sha: str, base_sha: str, merge_base_sha: str,
                          result: dict) -> dict:
-        infra_errors = [e for e in result["errors"]
-                       if any(k in e.lower() for k in ("git ", "worktree", "fetch", "api", "timeout", "merge-base"))]
-        if not result["success"]:
-            overall = "infra_error" if infra_errors else "failed"
-        elif result["warnings"]:
-            overall = "passed_with_warnings"
-        else:
-            overall = "passed"
+        infra = [e for e in result["errors"]
+                if any(k in e.lower() for k in ("git ", "worktree", "fetch", "api",
+                                                "timeout", "merge-base", "shallow"))]
+        overall = "infra_error" if (not result["success"] and infra) else \
+                  "failed" if not result["success"] else \
+                  "passed_with_warnings" if result["warnings"] else "passed"
 
         return {
             "schema_version": "1.0", "run_id": run_id,
@@ -116,7 +140,7 @@ class GitHubGate:
         body += "\n```json\n" + json.dumps(fb, indent=2) + "\n```"
         return body
 
-    # ── PR comment management (dedup determinístico) ─────────
+    # ── PR comment management ────────────────────────────────
 
     def _get_pr_number(self, branch: str) -> Optional[str]:
         r = self._gh("pr", "list", "--repo", self.repo,
@@ -124,95 +148,88 @@ class GitHubGate:
                       "--json", "number", "--jq", ".[0].number")
         return r.stdout.strip() if r.stdout.strip() else None
 
-    def _find_existing_comment_id(self, pr_num: str, marker: str) -> Optional[int]:
-        """Busca comment ID pelo marcador, com paginação."""
+    def _get_all_comments(self, pr_num: str) -> list[dict]:
+        """Retorna todos os comments do PR (paginação completa)."""
+        comments = []
         page = 1
         while True:
             r = self._gh("api",
                 f"repos/{self.repo}/issues/{pr_num}/comments?per_page=100&page={page}",
-                "--jq", ".[] | {id, body}")
+                "--jq", ".[] | {id, body, created_at, updated_at}")
             if r.returncode != 0 or not r.stdout.strip():
                 break
             for entry in r.stdout.strip().split("\n"):
-                if not entry.strip():
+                entry = entry.strip()
+                if not entry:
                     continue
                 try:
-                    c = json.loads(entry)
-                    if marker in c.get("body", ""):
-                        return c["id"]
+                    comments.append(json.loads(entry))
                 except json.JSONDecodeError:
                     continue
-            # Check if there's a next page
             if len(r.stdout.strip().split("\n")) < 100:
                 break
             page += 1
-        return None
+        return comments
 
-    def _update_comment(self, comment_id: int, body: str):
-        """Atualiza comentário existente em vez de criar novo."""
-        self._gh("api", f"repos/{self.repo}/issues/comments/{comment_id}",
-                 "-X", "PATCH",
-                 "-f", f"body={body}")
+    def _find_matching_comments(self, pr_num: str, marker: str) -> list[dict]:
+        """Busca comments que contêm o marcador (paginação)."""
+        return [c for c in self._get_all_comments(pr_num) if marker in c.get("body", "")]
 
-    def _create_comment(self, pr_num: str, body: str):
-        self._gh("pr", "comment", "--repo", self.repo, pr_num, "--body", body)
-
-    def _post_or_update(self, branch: str, body: str, marker: str):
-        """Posta ou atualiza comentário. 1 comentário canônico por par head/base."""
+    def _post_or_update(self, branch: str, body: str, fb: dict):
+        """Ponto 1 + Ponto 4: PATCH condicional + convergência concorrente."""
         pr_num = self._get_pr_number(branch)
         if not pr_num:
             return
-        existing_id = self._find_existing_comment_id(pr_num, marker)
-        if existing_id:
-            self._update_comment(existing_id, body)
-        else:
-            self._create_comment(pr_num, body)
-            # Pós-escrita: converge duplicatas (concorrência)
-            ids = []
-            page = 1
-            while True:
-                r = self._gh("api",
-                    f"repos/{self.repo}/issues/{pr_num}/comments?per_page=100&page={page}",
-                    "--jq", ".[] | {id, body}")
-                if r.returncode != 0 or not r.stdout.strip():
-                    break
-                for entry in r.stdout.strip().split("\n"):
-                    if not entry.strip(): continue
-                    try:
-                        c = json.loads(entry)
-                        if marker in c.get("body", ""):
-                            ids.append(c["id"])
-                    except json.JSONDecodeError:
-                        continue
-                if len(r.stdout.strip().split("\n")) < 100:
-                    break
-                page += 1
-            # Se mais de 1, mantém o mais antigo (menor id), remove os outros
-            if len(ids) > 1:
-                ids.sort()
-                for dup_id in ids[1:]:
-                    self._gh("api", f"repos/{self.repo}/issues/comments/{dup_id}",
+
+        marker = self._make_marker(fb["head_sha"], fb["base_sha"])
+        matching = self._find_matching_comments(pr_num, marker)
+
+        if not matching:
+            # Não existe → criar
+            self._gh("pr", "comment", "--repo", self.repo, pr_num, "--body", body)
+            return
+
+        # Ponto 4: convergência — escolher canônico (mais antigo = menor id)
+        matching.sort(key=lambda c: c.get("id", 0))
+        canonical = matching[0]
+        duplicates = matching[1:]
+
+        # Ponto 1: PATCH condicional — comparar projeção semântica
+        existing_fb = self._extract_fb_from_body(canonical.get("body", ""))
+        if existing_fb:
+            old_proj = self._semantic_projection(existing_fb)
+            new_proj = self._semantic_projection(fb)
+            if old_proj == new_proj:
+                # Semanticamente igual → não faz PATCH
+                # Mas ainda remove duplicatas se houver
+                for dup in duplicates:
+                    self._gh("api", f"repos/{self.repo}/issues/comments/{dup['id']}",
                              "-X", "DELETE")
+                return
+
+        # Semanticamente diferente → atualizar canônico
+        self._gh("api", f"repos/{self.repo}/issues/comments/{canonical['id']}",
+                 "-X", "PATCH", "-f", f"body={body}")
+
+        # Depois de atualizar, remover duplicatas
+        for dup in duplicates:
+            self._gh("api", f"repos/{self.repo}/issues/comments/{dup['id']}",
+                     "-X", "DELETE")
 
     # ── branch polling ────────────────────────────────────────
 
     def list_branches(self) -> list[dict]:
         r = self._gh("api", f"repos/{self.repo}/branches")
         if r.returncode != 0:
-            self._log(f"Erro listing branches: {r.stderr.strip()}")
             return []
-        branches = json.loads(r.stdout)
         ai_branches = []
-        for b in branches:
+        for b in json.loads(r.stdout):
             name = b.get("name", "")
             if not name.startswith(BRANCH_PREFIX) or name == "main":
                 continue
             ci = b.get("commit", {}) or {}
-            ai_branches.append({
-                "name": name,
-                "sha": ci.get("sha", "?"),
-                "date": ci.get("commit", {}).get("author", {}).get("date", "?"),
-            })
+            ai_branches.append({"name": name, "sha": ci.get("sha", "?"),
+                                "date": ci.get("commit", {}).get("author", {}).get("date", "?")})
         return ai_branches
 
     def create_pr(self, branch: str) -> Optional[str]:
@@ -223,22 +240,20 @@ class GitHubGate:
         r = self._gh("pr", "create", "--repo", self.repo,
                       "--head", branch, "--base", "main",
                       "--title", title,
-                      "--body", f"🤖 PR automático do branch `{branch}`.\n\nAguardando validação do Hermes Gate.")
+                      "--body", f"🤖 PR automático do branch `{branch}`.")
         return r.stdout.strip() if r.returncode == 0 else None
-
-    # ── set_status (SHA fixo, nunca consulta branch) ─────────
 
     def set_status(self, head_sha: str, state: str, description: str):
         self._gh("api", f"repos/{self.repo}/statuses/{head_sha}",
                  "-f", f"state={state}",
                  "-f", f"context=hermes-gate/validate",
-                 "-f", f"description={description}",
-                 "-f", f"target_url=https://github.com/{self.repo}/pull?q=head+{head_sha[:12]}")
+                 "-f", f"description={description}")
 
-    # ── validation (merge-base fixo) ──────────────────────────
+    # ── merge-base (Ponto 2 + Ponto 3) ────────────────────────
 
-    def _fetch_and_verify(self, branch: str, head_sha: str, base_sha: str, result: dict) -> Optional[str]:
-        """Fetch branch + base, calcula merge-base. Retorna merge_base_sha ou None."""
+    def _resolve_merge_base(self, branch: str, head_sha: str, base_sha: str,
+                            result: dict) -> Optional[str]:
+        """Fetch, calcula merge-base com --all, classifica falhas. Retorna SHA ou None."""
         # Fetch
         for ref, label in [("main", "main"), (branch, "branch")]:
             try:
@@ -249,51 +264,63 @@ class GitHubGate:
                 return None
             if r.returncode != 0:
                 result["success"] = False
-                result["errors"].append(f"git fetch {label} failed: {r.stderr.strip()}")
+                result["errors"].append(f"git fetch {label} failed")
                 return None
 
-        # Verifica SHAs localmente
+        # Confirma SHAs localmente
         for sha, label in [(head_sha, "head"), (base_sha, "base")]:
-            r = self._git("cat-file", "-e", sha)
-            if r.returncode != 0:
+            if self._git("cat-file", "-e", sha).returncode != 0:
                 result["success"] = False
                 result["errors"].append(f"commit {label} ({sha[:12]}) não encontrado localmente")
                 return None
 
-        # Calcula merge-base
+        # Ponto 2: git merge-base --all
         try:
-            r = self._git("merge-base", base_sha, head_sha, timeout=15)
+            r = self._git("merge-base", "--all", base_sha, head_sha, timeout=15)
         except subprocess.TimeoutExpired:
             result["success"] = False
-            result["errors"].append("git merge-base timed out — infra_error")
+            result["errors"].append("git merge-base timed out")
             return None
 
         if r.returncode != 0:
-            # Histórios não relacionados
-            result["success"] = False
-            result["errors"].append("UNRELATED_HISTORIES — branch e base sem ancestral comum")
+            # Ponto 3: classificar falha
+            shallow = self._git("rev-parse", "--is-shallow-repository")
+            if shallow.returncode == 0 and shallow.stdout.strip() == "true":
+                # Tenta unshallow
+                u = self._git("fetch", "--unshallow", timeout=60)
+                if u.returncode == 0:
+                    # Re-tenta merge-base
+                    r2 = self._git("merge-base", "--all", base_sha, head_sha, timeout=15)
+                    if r2.returncode == 0 and r2.stdout.strip():
+                        all_mb = [s.strip() for s in r2.stdout.strip().split("\n") if s.strip()]
+                        if len(all_mb) == 1:
+                            return all_mb[0]
+                result["success"] = False
+                result["errors"].append("MERGE_BASE_HISTORY_INCOMPLETE — histórico raso, unshallow falhou")
+            else:
+                result["success"] = False
+                result["errors"].append("UNRELATED_HISTORIES — branch e base sem ancestral comum")
             return None
 
-        merge_base_sha = r.stdout.strip()
-        if not merge_base_sha or len(merge_base_sha) < 10:
+        # Ponto 2: contar resultados
+        all_mb = [s.strip() for s in r.stdout.strip().split("\n") if s.strip()]
+        if len(all_mb) == 0:
             result["success"] = False
-            result["errors"].append("MERGE_BASE_HISTORY_INCOMPLETE — merge-base não encontrado")
+            result["errors"].append("MERGE_BASE_HISTORY_INCOMPLETE — merge-base vazio")
+            return None
+        if len(all_mb) > 1:
+            result["success"] = False
+            result["errors"].append(f"AMBIGUOUS_MERGE_BASE — {len(all_mb)} merge-bases encontrados (topologia não suportada no L1)")
             return None
 
-        # Verifica se merge-base é ambíguo (múltiplos resultados)
-        if "\n" in merge_base_sha:
-            result["success"] = False
-            result["errors"].append("AMBIGUOUS_MERGE_BASE — múltiplos merge-bases equivalentes (topologia não suportada no L1)")
-            return None
+        return all_mb[0]
 
-        return merge_base_sha.strip()
+    # ── validation ────────────────────────────────────────────
 
     def validate_commit(self, branch: str, head_sha: str, base_sha: str,
                         merge_base_sha: str) -> dict:
-        """Valida um commit específico usando merge-base fixo."""
         result = {"success": True, "errors": [], "warnings": [], "has_checkpoint": False}
 
-        # Diff do checkpoint: merge_base → head (não base → head)
         r = self._git("diff", merge_base_sha, head_sha, "--", "PROJECT_STATE.md")
         if r.returncode != 0:
             result["success"] = False
@@ -303,10 +330,9 @@ class GitHubGate:
             result["has_checkpoint"] = True
         else:
             result["success"] = False
-            result["errors"].append("PROJECT_STATE.md não foi alterado neste branch — checkpoint ausente")
+            result["errors"].append("PROJECT_STATE.md não foi alterado — checkpoint ausente")
 
-        # Worktree no head_sha
-        tmp_dir = f"/tmp/gate-validate-{uuid.uuid4().hex[:8]}"
+        tmp_dir = f"/tmp/gate-v4-{uuid.uuid4().hex[:8]}"
         subprocess.run(["rm", "-rf", tmp_dir])
         r = self._git("worktree", "add", "--detach", tmp_dir, head_sha)
         if r.returncode != 0:
@@ -315,19 +341,16 @@ class GitHubGate:
             return result
 
         try:
-            # .py alterados: merge_base → head
             r = self._git("diff", merge_base_sha, head_sha, "--name-only", "--", "*.py")
             if r.returncode != 0:
                 result["success"] = False
                 result["errors"].append(f"git diff py files failed: {r.stderr.strip()}")
                 return result
-
-            py_files = [f for f in r.stdout.strip().split('\n') if f.endswith('.py')]
-            for pyf in py_files:
-                full_path = Path(tmp_dir) / pyf
-                if not full_path.exists():
+            for pyf in [f for f in r.stdout.strip().split('\n') if f.endswith('.py')]:
+                fp = Path(tmp_dir) / pyf
+                if not fp.exists():
                     continue
-                sr = subprocess.run([sys.executable, "-m", "py_compile", str(full_path)],
+                sr = subprocess.run([sys.executable, "-m", "py_compile", str(fp)],
                                    capture_output=True, text=True)
                 if sr.returncode != 0:
                     result["success"] = False
@@ -349,63 +372,49 @@ class GitHubGate:
         for br in branches:
             name = br["name"]
             run_id = uuid.uuid4().hex[:12]
-
-            # Snapshot imutável: head_sha + base_sha
             head_sha = br["sha"]
             if head_sha == "?":
-                self._log(f"  {name}: SHA inválido, ignorando")
                 continue
             base_sha = self._get_branch_sha("main")
             if base_sha == "?":
-                self._log(f"  {name}: não foi possível obter SHA da main")
                 continue
 
             self._log(f"  → {name} head={head_sha[:12]} base={base_sha[:12]}")
 
-            # Validação com merge-base
+            # Merge-base + fetch
             ctx = {"success": True, "errors": [], "warnings": [], "has_checkpoint": False}
-            merge_base_sha = self._fetch_and_verify(name, head_sha, base_sha, ctx)
+            merge_base_sha = self._resolve_merge_base(name, head_sha, base_sha, ctx)
 
             if merge_base_sha is None:
-                # Erro no fetch/merge-base — usa ctx parcial p/ feedback
                 fb = self._feedback_packet(run_id, name, head_sha, base_sha, "", ctx)
-                status = "error"
-                desc = "; ".join(ctx["errors"][:2])
+                self.set_status(head_sha, "error", "; ".join(ctx["errors"][:2]))
             else:
                 self._log(f"    merge-base={merge_base_sha[:12]}")
                 result = self.validate_commit(name, head_sha, base_sha, merge_base_sha)
                 fb = self._feedback_packet(run_id, name, head_sha, base_sha, merge_base_sha, result)
 
-                if fb["overall_status"] == "passed":
-                    status, desc = "success", "Validação OK + checkpoint presente"
-                elif fb["overall_status"] == "passed_with_warnings":
-                    status, desc = "success", "OK (com warnings)"
+                if fb["overall_status"] in ("passed", "passed_with_warnings"):
+                    self.set_status(head_sha, "success", f"{fb['overall_status']}")
                 elif fb["overall_status"] == "infra_error":
-                    status, desc = "error", "; ".join(result["errors"][:2])
+                    self.set_status(head_sha, "error", "; ".join(result["errors"][:2]))
                 else:
-                    status, desc = "failure", "; ".join(result["errors"][:2])
+                    self.set_status(head_sha, "failure", "; ".join(result["errors"][:2]))
 
-            # Publica status no SHA validado (nunca consulta branch)
-            self.set_status(head_sha, status, desc)
-
-            # Cria PR se necessário
             if not self._get_pr_number(name):
                 pr_url = self.create_pr(name)
                 if pr_url:
                     self._log(f"    PR criado: {pr_url}")
 
-            # Posta ou atualiza comentário (dedup determinístico)
+            # Ponto 1 + Ponto 4: PATCH condicional + convergência
             comment_body = self._format_comment(fb)
-            marker = self._make_marker(head_sha, base_sha)
-            self._post_or_update(name, comment_body, marker)
+            self._post_or_update(name, comment_body, fb)
 
     def poll_loop(self, interval: int = 60):
-        self._log(f"Iniciando watch (intervalo={interval}s)")
         while True:
             try:
                 self.poll_once()
             except Exception as e:
-                self._log(f"Erro no poll: {e}")
+                self._log(f"Erro: {e}")
             time.sleep(interval)
 
     # ── restore ────────────────────────────────────────────────
@@ -420,55 +429,36 @@ class GitHubGate:
         if branch:
             pr_num = self._get_pr_number(branch)
             if pr_num:
-                # Busca último comentário DO GATE (marcado)
                 marker_prefix = "<!-- hermes-gate:"
-                page = 1
                 last_gate = None
-                while True:
-                    r = self._gh("api",
-                        f"repos/{self.repo}/issues/{pr_num}/comments?per_page=100&page={page}",
-                        "--jq", ".[] | {id, body}")
-                    if r.returncode != 0 or not r.stdout.strip():
-                        break
-                    for entry in r.stdout.strip().split("\n"):
-                        if not entry.strip(): continue
-                        try:
-                            c = json.loads(entry)
-                            if marker_prefix in c.get("body", ""):
-                                last_gate = c["body"]
-                        except json.JSONDecodeError:
-                            continue
-                    if len(r.stdout.strip().split("\n")) < 100:
-                        break
-                    page += 1
+                for c in self._get_all_comments(pr_num):
+                    if marker_prefix in c.get("body", ""):
+                        last_gate = c["body"]
                 if last_gate:
                     parts.append("=== ÚLTIMO FEEDBACK DO GATE ===\n" + last_gate)
 
-        return (
-            "Você está retomando um projeto em andamento. "
-            f"Data de captura: {datetime.datetime.utcnow().isoformat()}Z\n\n"
-            + "\n\n".join(parts)
-        )
+        return ("Você está retomando um projeto em andamento. "
+                f"Captura: {datetime.datetime.utcnow().isoformat()}Z\n\n"
+                + "\n\n".join(parts))
 
 
 # ── CLI ────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Hermes GitHub Gate L1")
-    sub = parser.add_subparsers(dest="command")
+    p = argparse.ArgumentParser(description="Hermes GitHub Gate L1 v4")
+    sub = p.add_subparsers(dest="command")
 
-    p_poll = sub.add_parser("poll", help="Poll branches ai/*")
-    p_poll.add_argument("--watch", action="store_true")
-    p_poll.add_argument("--once", action="store_true")
-    p_poll.add_argument("--interval", type=int, default=60)
+    pp = sub.add_parser("poll")
+    pp.add_argument("--watch", action="store_true")
+    pp.add_argument("--once", action="store_true")
+    pp.add_argument("--interval", type=int, default=60)
 
-    p_validate = sub.add_parser("pr-validate", help="Validar branch específico")
-    p_validate.add_argument("branch")
+    pv = sub.add_parser("pr-validate")
+    pv.add_argument("branch")
 
-    p_restore = sub.add_parser("restore", help="Gerar prompt de retomada")
-    p_restore.add_argument("--branch")
+    sub.add_parser("restore").add_argument("--branch")
 
-    args = parser.parse_args()
+    args = p.parse_args()
     gate = GitHubGate()
 
     if args.command == "poll":
@@ -477,24 +467,23 @@ def main():
         else:
             gate.poll_once()
     elif args.command == "pr-validate":
-        head_sha = gate._get_branch_sha(args.branch)
-        base_sha = gate._get_branch_sha("main")
-        if head_sha == "?" or base_sha == "?":
-            print("Erro: branch não encontrado")
+        hs, bs = gate._get_branch_sha(args.branch), gate._get_branch_sha("main")
+        if hs == "?" or bs == "?":
+            print("Branch não encontrado", file=sys.stderr)
             sys.exit(1)
         ctx = {"success": True, "errors": [], "warnings": [], "has_checkpoint": False}
-        merge_base = gate._fetch_and_verify(args.branch, head_sha, base_sha, ctx)
-        if not merge_base:
-            fb = gate._feedback_packet("cli", args.branch, head_sha, base_sha, "", ctx)
+        mb = gate._resolve_merge_base(args.branch, hs, bs, ctx)
+        if mb:
+            result = gate.validate_commit(args.branch, hs, bs, mb)
+            fb = gate._feedback_packet("cli", args.branch, hs, bs, mb, result)
         else:
-            result = gate.validate_commit(args.branch, head_sha, base_sha, merge_base)
-            fb = gate._feedback_packet("cli", args.branch, head_sha, base_sha, merge_base, result)
+            fb = gate._feedback_packet("cli", args.branch, hs, bs, "", ctx)
         print(json.dumps(fb, indent=2))
         sys.exit(0 if fb["overall_status"] in ("passed", "passed_with_warnings") else 1)
     elif args.command == "restore":
         print(gate.restore_prompt(args.branch if hasattr(args, 'branch') and args.branch else None))
     else:
-        parser.print_help()
+        p.print_help()
 
 
 if __name__ == "__main__":
