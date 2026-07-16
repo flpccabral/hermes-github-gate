@@ -1,20 +1,23 @@
 # PROJECT STATE — atualizado 2026-07-16T14:45Z por tier3/hermes
 ## Objetivo
-GitHub Gate — Hermes Agent plugin que monitores branches ai/*, valida código, abre PRs e seta status checks.
+GitHub Gate — Hermes Agent plugin que monitora branches ai/*, valida código, abre PRs e seta status checks.
 
 ## Tarefa atual
-Corrigir itens críticos apontados pela revisão do Claude Fable 5 no PR #1.
+Formalizar regra de responsabilidades entre tiers.
 
 ## Estado incompleto
-- validate_branch corrigido: agora é diff-based (não existencia-based) ✅
-- post_pr_comment: precisa de dedup real (não postar mesmo body repetido)
-- PROJECT_STATE.md agora atualizado neste PR
+- MVP do Gate implementado e testado (reprovação ✅ + aprovação ✅)
+- Falta registrar no DECISIONS.md a regra de responsabilidades
 
 ## Próximas 3 ações
-1. Commitar correções e fazer push para o branch do PR
-2. Claude Fable 5 revisar as correções
-3. Merge do PR e configurar branch protection na main
+1. Registrar regra no DECISIONS.md: Claude projeta, Hermes orquestra, sub-agent codifica
+2. Comunicar regra ao Claude no chat
+3. Fechar PR #2 do smoke test e limpar branches
 
 ## Bugs conhecidos / armadilhas
-- py_compile não detecta erros de runtime, só de sintaxe
-- Gate depende de gh CLI autenticado
+- Nenhum
+
+## Regra de responsabilidades (decisão 002)
+- Claude Fable 5 (Tier 1): ONLY design, architecture, review, decisions. ZERO código.
+- Hermes (Tier 2): interpreta design de Claude, delega para sub-agentes.
+- Sub-agente (Tier 3): única entidade que escreve código no repositório.
