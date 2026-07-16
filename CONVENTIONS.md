@@ -19,7 +19,7 @@ hermes-github-gate/
 ```
 
 ## Naming
-- Branches: `ai/<tier>/<descricao>` (ex: `ai/claude/refresh-tokens`)
+- Branches: `task/<task_id>-<descricao>` (ex: `task/TASK-0042-refresh-tokens`)
 - Commits: `checkpoint(<tier>): <descricao>`
 - Python: snake_case para funções/variáveis, PascalCase para classes
 
