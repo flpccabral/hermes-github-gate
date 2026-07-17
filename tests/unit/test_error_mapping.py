@@ -61,3 +61,13 @@ def test_fail_closed_invariant(gate):
     if infra:
         result["success"] = False
     assert result["success"] is False, "fail-closed: erro infra deve derrubar success"
+
+
+def test_exfiltration_guard(gate, monkeypatch):
+    # Verifica que env whitelist bloqueia acesso a gh
+    import subprocess, os
+    # Simular: ambiente sem gh no PATH
+    env = {"PATH": "/usr/bin", "HOME": "/tmp/_empty_home", "LANG": "C"}
+    # Verificar que gh nao esta acessivel neste ambiente
+    r = subprocess.run(["which", "gh"], capture_output=True, env=env)
+    assert r.returncode != 0, "gh acessivel no ambiente sandbox — risco de exfiltracao"

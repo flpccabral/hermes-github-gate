@@ -408,6 +408,7 @@ class GitHubGate:
         "TESTS_ABSENT":               ("code", False, "add_tests"),
         "TEST_FAILURE":               ("code", False, "fix_tests"),
         "TEST_TIMEOUT":               ("code", False, "fix_tests"),
+        "SANDBOX_ERROR":              ("infra", True, "retry"),
     }
 
     def _resolve_merge_base(self, branch: str, head_sha: str, base_sha: str,
@@ -531,38 +532,41 @@ class GitHubGate:
                 if sr.returncode != 0:
                     result["success"] = False
                     result["errors"].append(_make_error("SYNTAX_ERROR", f"Syntax error in {pyf}: {sr.stderr.strip()}", "code", False))
+
+            # Sandbox pytest nos testes do branch (se existirem)
+            tests_dir = Path(tmp_dir) / "tests"
+            if not tests_dir.exists():
+                result["warnings"].append(_make_error("TESTS_ABSENT", "L1 skip: sem testes", "code", False))
+            else:
+                home_dir = Path(tmp_dir) / "_home"
+                home_dir.mkdir(parents=True, exist_ok=True)
+                test_env = {
+                    "PATH": os.environ.get("PATH", ""),
+                    "PYTHONPATH": tmp_dir,
+                    "HOME": str(home_dir),
+                    "LANG": os.environ.get("LANG", ""),
+                }
+                try:
+                    tr = subprocess.run(
+                        [sys.executable, "-m", "pytest", "tests/", "-x", "-q"],
+                        cwd=tmp_dir,
+                        env=test_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                    )
+                    if tr.returncode != 0:
+                        result["success"] = False
+                        tail = tr.stdout[-500:] if len(tr.stdout) > 500 else tr.stdout
+                        result["errors"].append(_make_error("TEST_FAILURE", f"pytest falhou:\n{tail}", "code", False))
+                except subprocess.TimeoutExpired:
+                    result["success"] = False
+                    result["errors"].append(_make_error("TEST_TIMEOUT", "pytest excedeu 120s", "code", False))
+                except (OSError, FileNotFoundError) as e:
+                    result["success"] = False
+                    result["errors"].append(_make_error("SANDBOX_ERROR", f"infra: sandbox pytest falhou: {e}", "infra", True))
         finally:
             self._git("worktree", "remove", "--force", tmp_dir)
-
-        # Sandbox pytest nos testes do branch (se existirem)
-        tests_dir = Path(tmp_dir) / "tests"
-        if not tests_dir.exists():
-            result["warnings"].append(_make_error("TESTS_ABSENT", "L1 skip: sem testes", "code", False))
-        else:
-            home_dir = Path(tmp_dir) / "_home"
-            home_dir.mkdir(parents=True, exist_ok=True)
-            test_env = {
-                "PATH": os.environ.get("PATH", ""),
-                "PYTHONPATH": tmp_dir,
-                "HOME": str(home_dir),
-                "LANG": os.environ.get("LANG", ""),
-            }
-            try:
-                tr = subprocess.run(
-                    [sys.executable, "-m", "pytest", "tests/", "-x", "-q"],
-                    cwd=tmp_dir,
-                    env=test_env,
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                )
-                if tr.returncode != 0:
-                    result["success"] = False
-                    tail = tr.stdout[-500:] if len(tr.stdout) > 500 else tr.stdout
-                    result["errors"].append(_make_error("TEST_FAILURE", f"pytest falhou:\n{tail}", "code", False))
-            except subprocess.TimeoutExpired:
-                result["success"] = False
-                result["errors"].append(_make_error("TEST_TIMEOUT", "pytest excedeu 120s", "code", False))
 
         return result
 

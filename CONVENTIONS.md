@@ -19,7 +19,7 @@ hermes-github-gate/
 ```
 
 ## Naming
-- Branches: `task/<task_id>-<descricao>` (ex: `task/TASK-0042-refresh-tokens`)
+- Branches: `ai/<origem>/<task_id>-<slug>` onde origem ∈ {claude, chatgpt, hermes, task} (ex: `ai/task/TASK-0042-refresh-tokens`)
 - Commits: `checkpoint(<tier>): <descricao>`
 - Python: snake_case para funções/variáveis, PascalCase para classes
 
