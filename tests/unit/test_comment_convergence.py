@@ -10,7 +10,7 @@ def test_semantic_equal_no_patch(gate, monkeypatch):
             return subprocess.CompletedProcess(args, 0, "42", "")
         if "comments?" in cmd and "page=1" in cmd:
             return subprocess.CompletedProcess(args, 0, 
-                '{"id":1,"body":"<!-- hermes-gate:L1-v1:abc:def:end -->\\n```json\\n{\\"head_sha\\":\\"abc\\",\\"base_sha\\":\\"def\\",\\"merge_base_sha\\":\\"ghi\\",\\"overall_status\\":\\"passed\\",\\"checkpoint_present\\":true,\\"errors\\":[],\\"warnings\\":[],\\"validator_version\\":\\"L1-v1\\",\\"next_action\\":\\"merge\\"}\\n```"}', "")
+                '[{"id":1,"body":"<!-- hermes-gate:L1-v1:abc:def:end -->\\n```json\\n{\\"head_sha\\":\\"abc\\",\\"base_sha\\":\\"def\\",\\"merge_base_sha\\":\\"ghi\\",\\"overall_status\\":\\"passed\\",\\"checkpoint_present\\":true,\\"errors\\":[],\\"warnings\\":[],\\"validator_version\\":\\"L1-v1\\",\\"next_action\\":\\"merge\\"}\\n```"}]', "")
         if "PATCH" in cmd:
             patched.append(True)
             return subprocess.CompletedProcess(args, 0, "", "")
@@ -35,7 +35,7 @@ def test_semantic_different_patches(gate, monkeypatch):
             return subprocess.CompletedProcess(args, 0, "42", "")
         if "comments?" in cmd and "page=1" in cmd:
             return subprocess.CompletedProcess(args, 0,
-                '{"id":1,"body":"<!-- hermes-gate:L1-v1:abc:def:end -->\\n```json\\n{\\"head_sha\\":\\"abc\\",\\"base_sha\\":\\"def\\",\\"merge_base_sha\\":\\"ghi\\",\\"overall_status\\":\\"failed\\",\\"checkpoint_present\\":false,\\"errors\\":[{\\"code\\":\\"SYNTAX_ERROR\\"}],\\"warnings\\":[],\\"validator_version\\":\\"L1-v1\\",\\"next_action\\":\\"fix_code\\"}\\n```"}', "")
+                '[{"id":1,"body":"<!-- hermes-gate:L1-v1:abc:def:end -->\\n```json\\n{\\"head_sha\\":\\"abc\\",\\"base_sha\\":\\"def\\",\\"merge_base_sha\\":\\"ghi\\",\\"overall_status\\":\\"failed\\",\\"checkpoint_present\\":false,\\"errors\\":[{\\"code\\":\\"SYNTAX_ERROR\\"}],\\"warnings\\":[],\\"validator_version\\":\\"L1-v1\\",\\"next_action\\":\\"fix_code\\"}\\n```"}]', "")
         if "PATCH" in cmd:
             patched.append(True)
             return subprocess.CompletedProcess(args, 0, "", "")
@@ -67,8 +67,7 @@ def test_patch_fail_prevents_delete(gate, monkeypatch):
             # Retorna um canônico + uma duplicata
             return subprocess.CompletedProcess(
                 args, 0,
-                '{"id":1,"body":"<!-- hermes-gate:L1-v1:abc:def:end -->\\n```json\\n{\\"head_sha\\":\\"abc\\",\\"base_sha\\":\\"def\\",\\"merge_base_sha\\":\\"ghi\\",\\"overall_status\\":\\"failed\\",\\"checkpoint_present\\":false,\\"errors\\":[{\\"code\\":\\"SYNTAX_ERROR\\"}],\\"warnings\\":[],\\"validator_version\\":\\"L1-v1\\",\\"next_action\\":\\"fix_code\\"}\\n```"}\n'
-                '{"id":2,"body":"<!-- hermes-gate:L1-v1:abc:def:end -->\\n```json\\n{\\"head_sha\\":\\"abc\\",\\"base_sha\\":\\"def\\",\\"merge_base_sha\\":\\"ghi\\",\\"overall_status\\":\\"failed\\",\\"checkpoint_present\\":false,\\"errors\\":[{\\"code\\":\\"SYNTAX_ERROR\\"}],\\"warnings\\":[],\\"validator_version\\":\\"L1-v1\\",\\"next_action\\":\\"fix_code\\"}\\n```"}',
+                '[{"id":1,"body":"<!-- hermes-gate:L1-v1:abc:def:end -->\\n```json\\n{\\"head_sha\\":\\"abc\\",\\"base_sha\\":\\"def\\",\\"merge_base_sha\\":\\"ghi\\",\\"overall_status\\":\\"failed\\",\\"checkpoint_present\\":false,\\"errors\\":[{\\"code\\":\\"SYNTAX_ERROR\\"}],\\"warnings\\":[],\\"validator_version\\":\\"L1-v1\\",\\"next_action\\":\\"fix_code\\"}\\n```"},{"id":2,"body":"<!-- hermes-gate:L1-v1:abc:def:end -->\\n```json\\n{\\"head_sha\\":\\"abc\\",\\"base_sha\\":\\"def\\",\\"merge_base_sha\\":\\"ghi\\",\\"overall_status\\":\\"failed\\",\\"checkpoint_present\\":false,\\"errors\\":[{\\"code\\":\\"SYNTAX_ERROR\\"}],\\"warnings\\":[],\\"validator_version\\":\\"L1-v1\\",\\"next_action\\":\\"fix_code\\"}\\n```"}]',
                 "",
             )
         if "PATCH" in cmd:

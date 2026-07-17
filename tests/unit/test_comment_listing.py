@@ -7,14 +7,20 @@ def _make_gh_response(data, rc=0):
     stdout = "\n".join(json.dumps(d) for d in data) if data else ""
     return subprocess.CompletedProcess(["gh"], rc, stdout, "")
 
+def _make_gh_response_array(data, rc=0):
+    """Simula resposta de array JSON bruto do gh --json."""
+    import subprocess
+    stdout = json.dumps(data)
+    return subprocess.CompletedProcess(["gh"], rc, stdout, "")
+
 def test_valid_json_added(gate, monkeypatch):
     """JSON valido → adicionado a comments."""
     calls = []
     def fake_gh(*args, **kwargs):
         calls.append(args)
         if "page=1" in str(args):
-            return _make_gh_response([{"id": 1, "body": "hello"}])
-        return _make_gh_response([])
+            return _make_gh_response_array([{"id": 1, "body": "hello"}])
+        return _make_gh_response_array([])
     monkeypatch.setattr(gate, '_gh', fake_gh)
     res = gate._get_all_comments("1")
     assert res["status"] in ("complete", "complete_empty")

@@ -5,12 +5,11 @@ github_gate.py — Hermes GitHub Gate L1 (v4 - PATCH condicional + merge-base --
 Bridge entre web AIs (Claude/ChatGPT via GitHub) e execução local.
 Polla branches ai/*, valida por merge-base fixo, abre PRs, seta status.
 """
-import argparse, datetime, hashlib, json, os, subprocess, sys, time, uuid
+import argparse, datetime, hashlib, json, os, re, subprocess, sys, time, uuid
 from typing import Optional
 from pathlib import Path
 
 REPO = "flpccabral/hermes-github-gate"
-STATE_FILES = ["PROJECT_STATE.md", "DECISIONS.md", "CONVENTIONS.md", "FILEMAP.md"]
 BRANCH_PREFIX = "ai/"
 VALIDATOR_VERSION = "L1-v1"
 
@@ -37,10 +36,13 @@ _SEMANTIC_SKIP = {"run_id", "timestamps", "schema_version"}
 
 
 class GitHubGate:
-    def __init__(self, repo: str = REPO, gh_cmd: str = "gh"):
+    _STATE_FILES = ["PROJECT_STATE.md", "DECISIONS.md", "CONVENTIONS.md", "FILEMAP.md"]
+
+    def __init__(self, repo: str = REPO, gh_cmd: str = "gh", require_gh: bool = True):
         self.repo = repo
         self.gh = gh_cmd
-        self._check_gh()
+        if require_gh:
+            self._check_gh()
 
     # ── helpers ──────────────────────────────────────────────
 
@@ -78,11 +80,13 @@ class GitHubGate:
     def _semantic_projection(self, fb: dict) -> str:
         """Projeção canônica: só campos que representam o resultado funcional.
         Ignora run_id, timestamps, etc. Saída determinística p/ comparação."""
+        def _redact(msg: str) -> str:
+            return re.sub(r'/tmp/gate-v4-[a-f0-9]+', '/tmp/gate-v4-<REDACTED>', msg)
         errors_norm = sorted(
-            (e.get("code", ""), e.get("message", "")) for e in fb.get("errors", [])
+            (e.get("code", ""), _redact(e.get("message", ""))) for e in fb.get("errors", [])
         )
         warnings_norm = sorted(
-            (w.get("code", ""), w.get("message", "")) for w in fb.get("warnings", [])
+            (w.get("code", ""), _redact(w.get("message", ""))) for w in fb.get("warnings", [])
         )
         payload = json.dumps({
             "validator_version": fb.get("validator_version", ""),
@@ -193,8 +197,7 @@ class GitHubGate:
         while True:
             try:
                 r = self._gh("api",
-                    f"repos/{self.repo}/issues/{pr_num}/comments?per_page=100&page={page}",
-                    "--jq", ".[] | {id, body, created_at, updated_at}")
+                    f"repos/{self.repo}/issues/{pr_num}/comments?per_page=100&page={page}")
             except Exception as e:
                 result["error"] = f"API call failed at page {page}: {e}"
                 return result
@@ -205,21 +208,27 @@ class GitHubGate:
                 # Falha no meio da paginação → resultado parcial inválido
                 result["error"] = f"Paginação incompleta na página {page}: {r.stderr.strip()[:200]}"
                 return result
-            if not r.stdout.strip():
+            try:
+                data = json.loads(r.stdout) if r.stdout.strip() else []
+            except json.JSONDecodeError:
+                result["status"] = "failed"
+                result["error"] = f"COMMENT_LIST_PARSE_FAILED — resposta inválida na página {page}"
+                return result
+            if not isinstance(data, list):
+                result["status"] = "failed"
+                result["error"] = f"COMMENT_LIST_PARSE_FAILED — tipo inesperado na página {page}"
+                return result
+            if not data:
                 break
-            for entry in r.stdout.strip().split("\n"):
-                entry = entry.strip()
-                if not entry:
-                    continue
-                try:
-                    c = json.loads(entry)
-                    if isinstance(c, dict) and "id" in c:
-                        comments.append(c)
-                except json.JSONDecodeError:
-                    result["status"] = "failed"
-                    result["error"] = f"COMMENT_LIST_PARSE_FAILED — entrada inválida na página {page}"
-                    return result
-            if len(r.stdout.strip().split("\n")) < 100:
+            for c in data:
+                if isinstance(c, dict) and "id" in c:
+                    comments.append({
+                        "id": c.get("id"),
+                        "body": c.get("body", ""),
+                        "created_at": c.get("created_at", ""),
+                        "updated_at": c.get("updated_at", ""),
+                    })
+            if len(data) < 100:
                 break
             page += 1
         result["comments"] = comments
@@ -234,6 +243,12 @@ class GitHubGate:
             if not res["comments"] and res["status"] == "complete":
                 res["status"] = "complete_empty"
         return res
+
+    def _get_pr_number(self, branch: str) -> Optional[str]:
+        r = self._gh("pr", "list", "--repo", self.repo,
+                      "--head", branch, "--state", "open",
+                      "--json", "number", "--jq", ".[0].number")
+        return r.stdout.strip() if r.stdout.strip() else None
 
     def _post_or_update(self, branch: str, body: str, fb: dict):
         """Ponto 1 + Ponto 4: PATCH condicional + convergência concorrente.
@@ -317,7 +332,6 @@ class GitHubGate:
                      "-X", "DELETE")
 
     # ── branch polling ────────────────────────────────────────
-
     def list_branches(self) -> list[dict]:
         r = self._gh("api", f"repos/{self.repo}/branches")
         if r.returncode != 0:
@@ -391,6 +405,9 @@ class GitHubGate:
         "WORKTREE_FAILED":            ("infra", True, "retry"),
         "CHECKPOINT_MISSING":         ("code", False, "fix_checkpoint"),
         "SYNTAX_ERROR":               ("code", False, "fix_code"),
+        "TESTS_ABSENT":               ("code", False, "add_tests"),
+        "TEST_FAILURE":               ("code", False, "fix_tests"),
+        "TEST_TIMEOUT":               ("code", False, "fix_tests"),
     }
 
     def _resolve_merge_base(self, branch: str, head_sha: str, base_sha: str,
@@ -517,6 +534,36 @@ class GitHubGate:
         finally:
             self._git("worktree", "remove", "--force", tmp_dir)
 
+        # Sandbox pytest nos testes do branch (se existirem)
+        tests_dir = Path(tmp_dir) / "tests"
+        if not tests_dir.exists():
+            result["warnings"].append(_make_error("TESTS_ABSENT", "L1 skip: sem testes", "code", False))
+        else:
+            home_dir = Path(tmp_dir) / "_home"
+            home_dir.mkdir(parents=True, exist_ok=True)
+            test_env = {
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONPATH": tmp_dir,
+                "HOME": str(home_dir),
+                "LANG": os.environ.get("LANG", ""),
+            }
+            try:
+                tr = subprocess.run(
+                    [sys.executable, "-m", "pytest", "tests/", "-x", "-q"],
+                    cwd=tmp_dir,
+                    env=test_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if tr.returncode != 0:
+                    result["success"] = False
+                    tail = tr.stdout[-500:] if len(tr.stdout) > 500 else tr.stdout
+                    result["errors"].append(_make_error("TEST_FAILURE", f"pytest falhou:\n{tail}", "code", False))
+            except subprocess.TimeoutExpired:
+                result["success"] = False
+                result["errors"].append(_make_error("TEST_TIMEOUT", "pytest excedeu 120s", "code", False))
+
         return result
 
     # ── polling ────────────────────────────────────────────────
@@ -528,7 +575,10 @@ class GitHubGate:
             self._log("Nenhum branch ai/* encontrado")
             return
 
+        metrics_path = Path(__file__).resolve().parent.parent / "gate" / "metrics.jsonl"
+
         for br in branches:
+            t_start = datetime.datetime.utcnow()
             name = br["name"]
             run_id = uuid.uuid4().hex[:12]
             head_sha = br["sha"]
@@ -585,6 +635,28 @@ class GitHubGate:
                 if pr_url:
                     self._log(f"    PR criado: {pr_url}")
 
+            # 6. AUDIT PLANE: append linha de métricas v1
+            try:
+                t_end = datetime.datetime.utcnow()
+                duration_ms = int((t_end - t_start).total_seconds() * 1000)
+                audit_line = json.dumps({
+                    "schema": "audit-1.0",
+                    "run_id": run_id,
+                    "branch": name,
+                    "head_sha": head_sha,
+                    "base_sha": base_sha,
+                    "merge_base_sha": merge_base_sha_val,
+                    "overall_status": fb.get("overall_status", ""),
+                    "publication_status": publication_status,
+                    "error_codes": [e.get("code", "") for e in result.get("errors", [])],
+                    "t_poll_start": t_start.isoformat() + "Z",
+                    "duration_ms": duration_ms,
+                }, sort_keys=True, separators=(",", ":"))
+                with open(metrics_path, "a", encoding="utf-8") as f:
+                    f.write(audit_line + "\n")
+            except Exception:
+                pass  # nunca quebrar o poll por causa de logging
+
     def poll_loop(self, interval: int = 60):
         while True:
             try:
@@ -596,13 +668,24 @@ class GitHubGate:
     # ── restore ────────────────────────────────────────────────
 
     def restore_prompt(self, branch: Optional[str] = None) -> str:
+        repo_root = Path(__file__).resolve().parent.parent
         parts = []
-        for fname in STATE_FILES:
-            p = Path(fname)
+        for fname in self._STATE_FILES:
+            p = repo_root / fname
             if p.exists():
                 parts.append(f"=== {fname} ===\n{p.read_text(encoding='utf-8')}")
 
-        if branch:
+        short_sha = "desconhecido"
+        try:
+            r = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                               capture_output=True, text=True,
+                               cwd=repo_root, timeout=15)
+            if r.returncode == 0:
+                short_sha = r.stdout.strip()
+        except Exception:
+            pass
+
+        if branch and self.gh:
             pr_num = self._get_pr_number(branch)
             if pr_num:
                 marker_prefix = "<!-- hermes-gate:"
@@ -616,7 +699,8 @@ class GitHubGate:
                     parts.append("=== ÚLTIMO FEEDBACK DO GATE ===\n" + last_gate)
 
         return ("Você está retomando um projeto em andamento. "
-                f"Captura: {datetime.datetime.utcnow().isoformat()}Z\n\n"
+                f"Captura: {datetime.datetime.utcnow().isoformat()}Z "
+                f"(commit {short_sha})\n\n"
                 + "\n\n".join(parts))
 
 
@@ -637,7 +721,7 @@ def main():
     sub.add_parser("restore").add_argument("--branch")
 
     args = p.parse_args()
-    gate = GitHubGate()
+    gate = GitHubGate() if args.command != "restore" else GitHubGate(require_gh=False)
 
     if args.command == "poll":
         if args.watch:
