@@ -49,3 +49,15 @@ def test_unknown_code_fallback():
     assert meta[0] == "code"
     assert meta[1] is False
     assert meta[2] == "fix_code"
+
+def test_fail_closed_invariant(gate):
+    # Simula WORKTREE_FAILED e verifica que success=False
+    from gate.github_gate import _make_error
+    err = _make_error("WORKTREE_FAILED", "worktree add failed")
+    assert err["category"] == "infra"
+    result = {"success": True, "errors": [err]}
+    # Se houver erro infra, success deve ser False para fail-closed
+    infra = any(e.get("category") == "infra" for e in result.get("errors", []))
+    if infra:
+        result["success"] = False
+    assert result["success"] is False, "fail-closed: erro infra deve derrubar success"

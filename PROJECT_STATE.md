@@ -1,4 +1,4 @@
-# PROJECT STATE — L1 COMPLETE
+# PROJECT STATE — L0-HARDENED (L1 EM ANDAMENTO)
 ## Status
 - main: 35d8f40
 - PR#3 (L1 Gate): merged
@@ -15,6 +15,7 @@
 - 007: Regras de aprovacao por risco
 - 008: Supersessao parcial 001 (Tier 3 escritor)
 ## Proximos
+- P0: G1b — Testes de branch (branch naming canonico e visibilidade ao gate)
 - P1: Testes de integracao (tests/integration/)
 - P2: Polling como servico supervisionado (macOS: launchd, Linux: systemd)
 - P3: Robustez operacional (lock, timeout, metricas)
