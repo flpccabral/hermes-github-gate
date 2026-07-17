@@ -35,3 +35,12 @@ def sample_fb():
         "next_action": "merge",
         "timestamps": {"poll_utc": "2026-07-16T21:00:00Z"},
     }
+
+@pytest.fixture
+def gate_integration():
+    """Gate instance real, sem auth check, sem repo real."""
+    g = GitHubGate.__new__(GitHubGate)
+    g.repo = "flpccabral/hermes-github-gate"
+    g.gh = "gh"
+    g._log = lambda msg: None
+    return g
